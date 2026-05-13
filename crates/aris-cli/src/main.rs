@@ -1355,6 +1355,10 @@ impl LiveCli {
                 "Qwen"
             } else if base.contains("generativelanguage.googleapis") {
                 "Gemini"
+            } else if base.contains("xiaomimimo") {
+                "Xiaomi"
+            } else if base.contains("volces") {
+                "Doubao"
             } else {
                 "OpenAI"
             }
@@ -1649,6 +1653,15 @@ impl LiveCli {
                         ("GLM-5", "Zhipu · GLM 5 latest"),
                         ("MiniMax-M2.7", "MiniMax · M2.7 latest"),
                         ("kimi-k2.5", "Kimi · K2.5 reasoning"),
+                        ("mimo-v2.5-pro", "Xiaomi · MiMo v2.5 Pro"),
+                        ("mimo-v2.5", "Xiaomi · MiMo v2.5"),
+                        ("mimo-v2-pro", "Xiaomi · MiMo v2 Pro"),
+                        ("mimo-v2-omni", "Xiaomi · MiMo v2 Omni"),
+                        ("qwen3.6-plus", "Alibaba · Qwen 3.6 Plus (1M ctx)"),
+                        ("qwen3.6-flash", "Alibaba · Qwen 3.6 Flash (1M ctx)"),
+                        ("qwen3.6-max-preview", "Alibaba · Qwen 3.6 Max Preview"),
+                        ("doubao-pro-4k", "ByteDance · Doubao Pro 4K"),
+                        ("doubao-lite-4k", "ByteDance · Doubao Lite 4K"),
                     ]
                     .into_iter()
                     .map(|(name, desc)| input::SelectItem {
@@ -3199,11 +3212,44 @@ fn build_system_prompt(model_id: Option<&str>) -> Result<Vec<String>, Box<dyn st
         "claude-opus-4-7" => "Claude Opus 4.7",
         "claude-sonnet-4-6" => "Claude Sonnet 4.6",
         "claude-haiku-4-5-20251001" => "Claude Haiku 4.5",
+        "deepseek-v4-pro" => "DeepSeek V4 Pro",
+        "mimo-v2.5-pro" => "Xiaomi MiMo v2.5 Pro",
+        "mimo-v2.5" => "Xiaomi MiMo v2.5",
+        "mimo-v2-pro" => "Xiaomi MiMo v2 Pro",
+        "mimo-v2-omni" => "Xiaomi MiMo v2 Omni",
+        "qwen3.6-plus" => "Qwen 3.6 Plus",
+        "qwen3.6-flash" => "Qwen 3.6 Flash",
+        "qwen3.6-max-preview" => "Qwen 3.6 Max Preview",
+        "doubao-pro-4k" => "Doubao Pro 4K",
+        "doubao-lite-4k" => "Doubao Lite 4K",
         other => other,
+    };
+    // Map model-name prefix to developer/vendor for the ARIS identity line.
+    // Without this, e.g. a DeepSeek user would see "developed by Anthropic".
+    let developer = if model_name.starts_with("mimo-") {
+        "Xiaomi"
+    } else if model_name.starts_with("deepseek-") {
+        "DeepSeek"
+    } else if model_name.starts_with("qwen-") || model_name.starts_with("qwen3.") {
+        "Alibaba"
+    } else if model_name.starts_with("doubao-") {
+        "ByteDance"
+    } else if model_name.starts_with("gpt-") || model_name.starts_with("o1") || model_name.starts_with("o3") || model_name.starts_with("o4") {
+        "OpenAI"
+    } else if model_name.starts_with("gemini-") {
+        "Google"
+    } else if model_name.starts_with("GLM") || model_name.starts_with("glm") {
+        "Zhipu"
+    } else if model_name.starts_with("MiniMax") || model_name.starts_with("minimax") {
+        "MiniMax"
+    } else if model_name.starts_with("kimi-") || model_name.starts_with("moonshot-") {
+        "Moonshot"
+    } else {
+        "Anthropic"
     };
     prompt.push(format!(
         "You are running inside ARIS (Auto Research in Sleep), a research automation CLI. \
-         Your exact model is {model_name} ({friendly_name}), developed by Anthropic. \
+         Your exact model is {model_name} ({friendly_name}), developed by {developer}. \
          When users ask what model you are, answer: \"{friendly_name}\" (model ID: {model_name}). \
          Do NOT guess or hallucinate a different version number."
     ));

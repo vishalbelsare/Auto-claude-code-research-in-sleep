@@ -302,7 +302,10 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     println!("  4. GLM         (GLM-5)");
     println!("  5. MiniMax     (MiniMax-M2.7)");
     println!("  6. Kimi        (kimi-k2.5)");
-    println!("  7. DeepSeek    (deepseek-chat)");
+    println!("  7. DeepSeek    (deepseek-v4-pro)");
+    println!("  8. Xiaomi      (mimo-v2.5-pro)");
+    println!("  9. Qwen        (qwen3.6-plus)");
+    println!(" 10. Doubao      (doubao-pro-4k)");
 
     let default_executor = match config.executor_provider.as_deref() {
         Some("anthropic") => "1",
@@ -315,11 +318,14 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
             Some(u) if u.contains("bigmodel") => "4",
             Some(u) if u.contains("minimax") => "5",
             Some(u) if u.contains("moonshot") => "6",
+            Some(u) if u.contains("xiaomimimo") => "8",
+            Some(u) if u.contains("dashscope") => "9",
+            Some(u) if u.contains("volces") => "10",
             _ => "2",
         },
         _ => "1",
     };
-    let exec_choice_raw = prompt_with_default("  Choose [1-7]", default_executor)?;
+    let exec_choice_raw = prompt_with_default("  Choose [1-10]", default_executor)?;
     let exec_choice = exec_choice_raw.trim();
     // Detect real menu change, not just provider-string change. OpenAI / Gemini /
     // GLM / MiniMax / Kimi all serialize to provider="openai" so we must compare
@@ -334,6 +340,9 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         "5" => ("openai", "EXECUTOR_API_KEY", "MiniMax API key", Some("https://api.minimax.chat/v1"), "MiniMax-M2.7"),
         "6" => ("openai", "EXECUTOR_API_KEY", "Kimi API key", Some("https://api.moonshot.cn/v1"), "kimi-k2.5"),
         "7" => ("anthropic-compat", "ANTHROPIC_AUTH_TOKEN", "DeepSeek API key", Some("https://api.deepseek.com/anthropic"), "deepseek-v4-pro"),
+        "8" => ("openai", "EXECUTOR_API_KEY", "Xiaomi API key", Some("https://token-plan-cn.xiaomimimo.com/v1"), "mimo-v2.5-pro"),
+        "9" => ("openai", "EXECUTOR_API_KEY", "Qwen (DashScope) API key", Some("https://dashscope.aliyuncs.com/compatible-mode/v1"), "qwen3.6-plus"),
+        "10" => ("openai", "EXECUTOR_API_KEY", "Doubao (Ark) API key", Some("https://ark.cn-beijing.volces.com/api/v3"), "doubao-pro-4k"),
         _ => ("anthropic", "ANTHROPIC_API_KEY", "Anthropic API key", None, "claude-opus-4-7"),
     };
 
