@@ -10,6 +10,14 @@ use crossterm::{
 
 const MAX_DROPDOWN: usize = 10;
 
+/// Per-read renderer state: tracks where the cursor was last drawn so we can
+/// move back to the start of the input area before clearing, even when the
+/// buffer wraps across multiple physical rows.
+#[derive(Debug, Default)]
+struct RenderState {
+    cursor_display_width: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
@@ -60,15 +68,16 @@ impl LineEditor {
         let mut sel: usize = 0; // dropdown selection index
         let mut history_idx: Option<usize> = None;
         let mut saved_buf: Option<Vec<char>> = None;
+        let mut render = RenderState::default();
 
-        self.redraw(&mut stdout, &buf, cursor_pos, sel)?;
+        self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
 
         loop {
             let ev = event::read()?;
 
             // Handle terminal resize
             if let Event::Resize(..) = ev {
-                self.redraw(&mut stdout, &buf, cursor_pos, sel)?;
+                self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
                 continue;
             }
 
@@ -85,7 +94,7 @@ impl LineEditor {
             match (code, modifiers) {
                 // ── Exit / Cancel ──────────────────────────────────────────
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    self.clear_and_restore(&mut stdout, &buf, cursor_pos)?;
+                    self.clear_and_restore(&mut stdout, &mut render, &buf, cursor_pos)?;
                     if buf.is_empty() {
                         return Ok(ReadOutcome::Exit);
                     } else {
@@ -93,7 +102,7 @@ impl LineEditor {
                     }
                 }
                 (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    self.clear_and_restore(&mut stdout, &buf, cursor_pos)?;
+                    self.clear_and_restore(&mut stdout, &mut render, &buf, cursor_pos)?;
                     return Ok(ReadOutcome::Exit);
                 }
 
@@ -102,10 +111,10 @@ impl LineEditor {
                     if !matches.is_empty() {
                         let (name, _) = &self.completions[matches[sel]];
                         let result = name.clone();
-                        self.accept_and_clear(&mut stdout, &result)?;
+                        self.accept_and_clear(&mut stdout, &mut render, &result)?;
                         return Ok(ReadOutcome::Submit(result));
                     }
-                    self.accept_and_clear(&mut stdout, &line)?;
+                    self.accept_and_clear(&mut stdout, &mut render, &line)?;
                     return Ok(ReadOutcome::Submit(line));
                 }
 
@@ -238,7 +247,7 @@ impl LineEditor {
                 _ => continue,
             }
 
-            self.redraw(&mut stdout, &buf, cursor_pos, sel)?;
+            self.redraw(&mut stdout, &mut render, &buf, cursor_pos, sel)?;
         }
     }
 
@@ -260,6 +269,7 @@ impl LineEditor {
     fn redraw(
         &self,
         stdout: &mut io::Stdout,
+        render: &mut RenderState,
         buf: &[char],
         cursor_pos: usize,
         sel: usize,
@@ -267,9 +277,14 @@ impl LineEditor {
         let line: String = buf.iter().collect();
         let matches = self.compute_matches(&line);
         let prompt_len = visible_len(&self.prompt);
+        let term_w = terminal_width();
+        let total_display_width = prompt_len + buf_display_width(buf, buf.len());
+        let input_rows = display_rows(total_display_width, term_w);
+        let cursor_display_width = prompt_len + buf_display_width(buf, cursor_pos);
 
-        // Clear from start of current line to end of screen
-        stdout.queue(cursor::MoveToColumn(0))?;
+        // Jump back to the start of the previously drawn input area (handles
+        // multi-row wrap) and clear everything that was drawn last time.
+        move_to_input_start(stdout, render, term_w)?;
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
 
         // Draw prompt + input buffer
@@ -278,7 +293,6 @@ impl LineEditor {
 
         // Draw dropdown if there are matches
         let dropdown_rows: u16 = if !matches.is_empty() {
-            let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
             let max_name = matches
                 .iter()
                 .map(|&i| self.completions[i].0.len())
@@ -331,11 +345,16 @@ impl LineEditor {
             0
         };
 
-        // Move cursor back to input line
-        if dropdown_rows > 0 {
-            stdout.queue(cursor::MoveToPreviousLine(dropdown_rows))?;
-        }
-        stdout.queue(cursor::MoveToColumn((prompt_len + buf_display_width(buf, cursor_pos)) as u16))?;
+        // Move cursor back to the logical cursor position inside the input
+        // area, accounting for both input wrap rows and dropdown rows below.
+        move_to_input_cursor(
+            stdout,
+            input_rows,
+            dropdown_rows,
+            cursor_display_width,
+            term_w,
+        )?;
+        render.cursor_display_width = cursor_display_width;
         stdout.flush()
     }
 
@@ -343,25 +362,39 @@ impl LineEditor {
     fn clear_and_restore(
         &self,
         stdout: &mut io::Stdout,
+        render: &mut RenderState,
         buf: &[char],
         cursor_pos: usize,
     ) -> io::Result<()> {
         let line: String = buf.iter().collect();
         let prompt_len = visible_len(&self.prompt);
-        stdout.queue(cursor::MoveToColumn(0))?;
+        let term_w = terminal_width();
+        let total_display_width = prompt_len + buf_display_width(buf, buf.len());
+        let input_rows = display_rows(total_display_width, term_w);
+        let cursor_display_width = prompt_len + buf_display_width(buf, cursor_pos);
+
+        move_to_input_start(stdout, render, term_w)?;
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
         stdout.queue(Print(&self.prompt))?;
         stdout.queue(Print(&line))?;
-        stdout.queue(cursor::MoveToColumn((prompt_len + buf_display_width(buf, cursor_pos)) as u16))?;
+        move_to_input_cursor(stdout, input_rows, 0, cursor_display_width, term_w)?;
+        render.cursor_display_width = cursor_display_width;
         stdout.flush()
     }
 
     /// Print accepted text and clear dropdown before returning.
-    fn accept_and_clear(&self, stdout: &mut io::Stdout, accepted: &str) -> io::Result<()> {
-        stdout.queue(cursor::MoveToColumn(0))?;
+    fn accept_and_clear(
+        &self,
+        stdout: &mut io::Stdout,
+        render: &mut RenderState,
+        accepted: &str,
+    ) -> io::Result<()> {
+        let term_w = terminal_width();
+        move_to_input_start(stdout, render, term_w)?;
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
         stdout.queue(Print(&self.prompt))?;
         stdout.queue(Print(accepted))?;
+        render.cursor_display_width = visible_len(&self.prompt) + visible_len(accepted);
         stdout.flush()
     }
 
@@ -380,6 +413,85 @@ impl LineEditor {
         }
         Ok(ReadOutcome::Submit(buffer))
     }
+}
+
+// ── Multi-line redraw helpers ────────────────────────────────────────────────
+
+fn terminal_width() -> usize {
+    terminal::size()
+        .map(|(w, _)| usize::from(w.max(1)))
+        .unwrap_or(120)
+}
+
+/// Move the cursor to the physical row/column where the input area starts,
+/// based on where the cursor was last drawn. Required to correctly clear a
+/// buffer that wrapped across multiple rows on the previous redraw.
+fn move_to_input_start(
+    stdout: &mut io::Stdout,
+    render: &RenderState,
+    term_w: usize,
+) -> io::Result<()> {
+    let (cursor_row, _) = display_position(render.cursor_display_width, term_w);
+    if cursor_row > 0 {
+        stdout.queue(cursor::MoveToPreviousLine(cursor_row))?;
+    }
+    stdout.queue(cursor::MoveToColumn(0))?;
+    Ok(())
+}
+
+/// After drawing the prompt+buffer (cursor naturally at the end of input,
+/// followed by `dropdown_rows` extra rows below), move the cursor back to the
+/// logical position within the input area.
+fn move_to_input_cursor(
+    stdout: &mut io::Stdout,
+    input_rows: u16,
+    dropdown_rows: u16,
+    cursor_display_width: usize,
+    term_w: usize,
+) -> io::Result<()> {
+    let (cursor_row, cursor_col) = display_position(cursor_display_width, term_w);
+    let lines_after_cursor = input_rows
+        .saturating_sub(1)
+        .saturating_sub(cursor_row)
+        .saturating_add(dropdown_rows);
+    if lines_after_cursor > 0 {
+        stdout.queue(cursor::MoveToPreviousLine(lines_after_cursor))?;
+    }
+    stdout.queue(cursor::MoveToColumn(cursor_col))?;
+    Ok(())
+}
+
+/// Number of physical rows needed to display `display_width` columns at the
+/// given terminal width. Always at least 1.
+fn display_rows(display_width: usize, term_w: usize) -> u16 {
+    let term_w = term_w.max(1);
+    let rows = display_width
+        .saturating_add(term_w - 1)
+        .checked_div(term_w)
+        .unwrap_or(1)
+        .max(1);
+    rows.min(u16::MAX as usize) as u16
+}
+
+/// Convert a display width (columns from row 0) into (row, col). For widths
+/// that land exactly on the terminal boundary we report the *previous* row's
+/// rightmost column to match where terminals actually leave the cursor before
+/// auto-wrapping.
+fn display_position(display_width: usize, term_w: usize) -> (u16, u16) {
+    let term_w = term_w.max(1);
+    if display_width == 0 {
+        return (0, 0);
+    }
+    let row = (display_width - 1) / term_w;
+    let col = if display_width % term_w == 0 {
+        term_w - 1
+    } else {
+        display_width % term_w
+    };
+    (
+        row.min(u16::MAX as usize) as u16,
+        col.min(u16::MAX as usize) as u16,
+    )
 }
 
 // ── Interactive select menu ──────────────────────────────────────────────────
