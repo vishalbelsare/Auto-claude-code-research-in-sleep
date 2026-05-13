@@ -17,6 +17,33 @@ use crate::{filter_tool_specs, format_tool_call_start, AllowedToolSet};
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Whether this model accepts an OpenAI-style `reasoning_effort` request field.
+/// Heuristic-only: matches OpenAI reasoning families (o1/o3/o4, gpt-5.5+) and
+/// providers that advertise an explicit thinking/reasoner variant.
+#[must_use]
+fn supports_reasoning_effort(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("gpt-5.5")
+        || m.contains("gpt-5.6")
+        || m.contains("reasoner")
+        || m.contains("thinking")
+}
+
+/// Effort tier sent alongside reasoning-capable models. Reads
+/// `ARIS_REASONING_EFFORT` and falls back to `xhigh`. Valid values per OpenAI
+/// reasoning API: `none` / `minimal` / `low` / `medium` / `high` / `xhigh`.
+#[must_use]
+fn reasoning_effort() -> String {
+    std::env::var("ARIS_REASONING_EFFORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "xhigh".to_string())
+}
+
 /// Resolve executor configuration from environment variables.
 ///
 /// Returns `(api_key, base_url, model)` or `None` if `EXECUTOR_PROVIDER` is not set to `openai`.
@@ -118,6 +145,14 @@ impl ApiClient for OpenAIRuntimeClient {
         if let Some(tools) = tools {
             body["tools"] = tools;
             body["tool_choice"] = json!("auto");
+        }
+
+        // For reasoning-capable models, attach the effort tier so the server
+        // doesn't silently default to medium. Safe for o1/o3/o4/gpt-5.5/
+        // thinking variants; older models would reject this field, hence the
+        // explicit allow-list.
+        if supports_reasoning_effort(&self.model) {
+            body["reasoning_effort"] = json!(reasoning_effort());
         }
 
         let url = format!(

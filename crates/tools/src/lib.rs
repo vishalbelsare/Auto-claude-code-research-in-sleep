@@ -3425,6 +3425,33 @@ fn send_reviewer_request_with_retry(
     Err(last_err.unwrap_or_else(|| "LlmReview request failed: unknown".to_string()))
 }
 
+/// Whether this reviewer model accepts an OpenAI-style `reasoning_effort`
+/// request field. Mirrors the allow-list in `aris-cli/openai_executor.rs`
+/// so reviewer and executor agree on which models route through which API
+/// shape.
+#[must_use]
+fn reviewer_supports_reasoning_effort(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("gpt-5.5")
+        || m.contains("gpt-5.6")
+        || m.contains("reasoner")
+        || m.contains("thinking")
+}
+
+/// Effort tier for reasoning-capable reviewer calls. Reads
+/// `ARIS_REASONING_EFFORT` and falls back to `xhigh`.
+#[must_use]
+fn reviewer_reasoning_effort() -> String {
+    std::env::var("ARIS_REASONING_EFFORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "xhigh".to_string())
+}
+
 fn call_anthropic_compat_reviewer(
     api_key: &str,
     endpoint: &str,
@@ -3466,10 +3493,18 @@ fn call_openai_compat_reviewer(
     model: &str,
     prompt: &str,
 ) -> Result<String, String> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}]
     });
+
+    // Reasoning-capable models (o1/o3/o4 family, gpt-5.5+, thinking variants)
+    // accept an explicit `reasoning_effort` field; older OpenAI-compat
+    // models reject it, so gate on an allow-list. Default tier is `xhigh`,
+    // overridable via `ARIS_REASONING_EFFORT`.
+    if reviewer_supports_reasoning_effort(model) {
+        body["reasoning_effort"] = serde_json::json!(reviewer_reasoning_effort());
+    }
 
     // Build a fresh client per request to avoid reusing a broken connection pool.
     let response = send_reviewer_request_with_retry(|| {
