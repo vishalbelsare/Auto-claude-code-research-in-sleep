@@ -45,7 +45,7 @@ pub use file_ops::{
 };
 pub use event_sink::{
     EventSink, EventType, JsonlEventSink, MetaLoggingLevel, NoopEventSink, RuntimeEvent,
-    now_iso8601,
+    now_iso8601, today_iso,
 };
 pub use hooks::{HookEvent, HookRunResult, HookRunner};
 pub use mcp::{

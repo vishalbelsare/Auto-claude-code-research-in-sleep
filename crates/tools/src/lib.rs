@@ -1596,8 +1596,14 @@ pub fn render_skill_discovery_section() -> Option<String> {
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-7";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+
+/// Subagent system date — use the same dynamic today as the main runtime
+/// (`runtime::today_iso`) so subagents don't get a frozen `"2026-03-31"`
+/// in their system prompt. Helper fn rather than a const so it stays live.
+fn default_agent_system_date() -> String {
+    runtime::today_iso()
+}
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
@@ -1740,7 +1746,7 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
+        default_agent_system_date(),
         std::env::consts::OS,
         "unknown",
         None,

@@ -526,7 +526,7 @@ pub(crate) fn filter_tool_specs(allowed_tools: Option<&AllowedToolSet>) -> Vec<t
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = runtime::today_iso();
     let mut index = 0;
 
     while index < args.len() {
@@ -2704,7 +2704,7 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover_with_git(&cwd, &runtime::today_iso())?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     Ok(StatusContext {
@@ -2853,7 +2853,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover(&cwd, &runtime::today_iso())?;
     let mut lines = vec![format!(
         "Memory
   Working directory {}
@@ -3229,7 +3229,7 @@ fn resolve_export_path(
 fn build_system_prompt(model_id: Option<&str>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut prompt = match load_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        &runtime::today_iso(),
         env::consts::OS,
         "unknown",
         model_id,

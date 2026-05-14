@@ -240,6 +240,22 @@ fn escape_json(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
+/// Current UTC date as `YYYY-MM-DD`. Used to inject the real "today" into
+/// system prompts (e.g. `ProjectContext::current_date`) — replacing the
+/// previously hard-coded `DEFAULT_DATE` constant that froze on the day the
+/// constant was last edited and made models refuse later real-world dates
+/// as "future/prompt injection".
+#[must_use]
+pub fn today_iso() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86400;
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Generate an ISO 8601 UTC timestamp.
 #[must_use]
 pub fn now_iso8601() -> String {
