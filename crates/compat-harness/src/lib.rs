@@ -1,3 +1,23 @@
+//! # compat-harness
+//!
+//! Despite the name, this crate is **not** a runtime regression
+//! harness — it's a static **manifest extractor**. Its job is to
+//! read the upstream Claude Code TypeScript sources (commands list,
+//! tool registry, bootstrap phases) and produce a structured
+//! `CompatReport` so that the Rust port (ARIS-Code) can be compared
+//! against the upstream surface at build/audit time.
+//!
+//! The CLI surface is `aris dump-manifests`, which prints the
+//! extracted manifest for human / CI inspection. It does not execute
+//! tools, does not spin up an interpreter, and does not exercise the
+//! runtime — none of the v0.4.x retry / compaction / interrupt /
+//! routing fixes have coverage here. Use the per-crate `cargo test`
+//! suites for those.
+//!
+//! The `claw-code` directory names in `UpstreamPaths` refer to the
+//! upstream project that ARIS-Code was forked from; they're vendor
+//! source locators, not branding.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
