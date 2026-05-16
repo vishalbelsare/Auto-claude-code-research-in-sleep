@@ -100,7 +100,7 @@ impl OpenAIRuntimeClient {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             http: reqwest::Client::builder()
-                .user_agent("aris/0.4.5")
+                .user_agent(concat!("aris/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             api_key: config.api_key,
             base_url: config.base_url,
