@@ -508,6 +508,25 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<(), McpServerManagerError> {
+        // v0.4.10 (M3 landmine fix): if a previous request left the
+        // child dead — server crashed, was OOM-killed, or timed out
+        // and we killed it ourselves in `McpStdioProcess::request` —
+        // clear the slot so the spawn path below recreates it. Without
+        // this we'd happily hand the next call to a dead pipe and the
+        // user would see `BrokenPipe` errors instead of a transparent
+        // respawn.
+        if let Some(server) = self.servers.get_mut(server_name) {
+            if let Some(process) = server.process.as_mut() {
+                match process.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        server.process = None;
+                        server.initialized = false;
+                    }
+                    Ok(None) => {}
+                }
+            }
+        }
+
         let needs_spawn = self
             .servers
             .get(server_name)
@@ -697,15 +716,94 @@ impl McpStdioProcess {
         self.read_jsonrpc_message().await
     }
 
+    /// Send a JSON-RPC request and wait for the matching response.
+    ///
+    /// v0.4.10 (M3 landmine fix): this used to forward straight to
+    /// `read_response()` with no timeout and no correlation check. If
+    /// the MCP server hung after `initialize`, `aris` would spin
+    /// forever on the read (this was the #151 / #172 "Calling
+    /// codex..." stall root cause). It also accepted whatever id the
+    /// server emitted, so a buggy/stale response could be returned for
+    /// a different in-flight call.
+    ///
+    /// Behaviour now (post-codex-review):
+    /// * The entire send+read round trip is wrapped in
+    ///   `tokio::time::timeout`. Default 60s, override via
+    ///   `MCP_REQUEST_TIMEOUT_SECS` env (clamped 1..=600). Wrapping
+    ///   both halves means a server that blocks on stdin (write-side
+    ///   hang because the pipe buffer fills) also unblocks the caller.
+    /// * After a successful read, the response id must equal the
+    ///   request id.
+    /// * On *any* failure mode (timeout, I/O error during
+    ///   send/read, id mismatch) we `kill().await` the child so the
+    ///   stdio pipes are flushed and the next call respawns from a
+    ///   clean state. `kill().await` (vs `start_kill()`) reaps the
+    ///   process — avoiding a zombie window where the manager's
+    ///   `try_wait()` could still see `Ok(None)` and reuse a poisoned
+    ///   pipe.
     pub async fn request<TParams: Serialize, TResult: DeserializeOwned>(
         &mut self,
         id: JsonRpcId,
         method: impl Into<String>,
         params: Option<TParams>,
     ) -> io::Result<JsonRpcResponse<TResult>> {
-        let request = JsonRpcRequest::new(id, method, params);
-        self.send_request(&request).await?;
-        self.read_response().await
+        let request = JsonRpcRequest::new(id.clone(), method, params);
+        let timeout = mcp_request_timeout();
+
+        // Wrap send+read together so a write-side block (e.g. server
+        // alive but not reading stdin, pipe buffer full on a large
+        // request body) also trips the deadline.
+        let send_then_read = async {
+            self.send_request(&request).await?;
+            self.read_response::<TResult>().await
+        };
+
+        let response: JsonRpcResponse<TResult> = match tokio::time::timeout(
+            timeout,
+            send_then_read,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                // I/O error during send or read. Stdio buffer is now
+                // ambiguous — kill so the next call respawns cleanly.
+                let _ = self.child.kill().await;
+                return Err(error);
+            }
+            Err(_elapsed) => {
+                let _ = self.child.kill().await;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "MCP server did not respond within {}s (override via MCP_REQUEST_TIMEOUT_SECS env, max 600s)",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+        };
+
+        if response.id != id {
+            // Correlation mismatch: server is desynced or buggy. Treat
+            // as fatal for this connection so we respawn cleanly.
+            let _ = self.child.kill().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP response id mismatch: expected {:?}, got {:?}",
+                    id, response.id
+                ),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Non-blocking liveness peek — `Ok(None)` means the child is still
+    /// running, `Ok(Some(_))` means it has exited, `Err` means we
+    /// couldn't poll. Used by `McpServerManager::ensure_server_ready`
+    /// to detect crashed servers and respawn them transparently.
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
     }
 
     pub async fn initialize(
@@ -789,6 +887,21 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let mut framed = header.into_bytes();
     framed.extend_from_slice(payload);
     framed
+}
+
+/// Resolve the MCP request read timeout from `MCP_REQUEST_TIMEOUT_SECS`
+/// env or fall back to 60s. Value is clamped to 1..=600s so a bogus
+/// override can't disable the timeout entirely or make it absurdly long.
+fn mcp_request_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 60;
+    const MIN_SECS: u64 = 1;
+    const MAX_SECS: u64 = 600;
+    let secs = std::env::var("MCP_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.clamp(MIN_SECS, MAX_SECS))
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 fn default_initialize_params() -> McpInitializeParams {
@@ -1658,6 +1771,314 @@ mod tests {
             assert_eq!(
                 log.lines().collect::<Vec<_>>(),
                 vec!["initialize", "tools/list", "tools/call"]
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    // ============================================================
+    // v0.4.10 (M3 landmine fix) — regression coverage for
+    //   • response.id ↔ request.id correlation
+    //   • read timeout via MCP_REQUEST_TIMEOUT_SECS
+    //   • automatic respawn after the child exits between calls
+    // The earlier #151 / #172 stalls all hit one of these three
+    // codepaths, so each gets its own dedicated MCP script + test.
+    // ============================================================
+
+    fn write_wrong_id_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("wrong-id-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(1)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "payload = sys.stdin.buffer.read(length)",
+            "request = json.loads(payload.decode())",
+            "# Intentionally respond with a different id so we exercise",
+            "# the correlation check.",
+            r"response = json.dumps({",
+            r"    'jsonrpc': '2.0',",
+            r"    'id': 999,",
+            r"    'result': {",
+            r"        'protocolVersion': request['params']['protocolVersion'],",
+            r"        'capabilities': {},",
+            r"        'serverInfo': {'name': 'wrong-id', 'version': '0.1.0'}",
+            r"    }",
+            r"}).encode()",
+            r"sys.stdout.buffer.write(f'Content-Length: {len(response)}\r\n\r\n'.encode() + response)",
+            "sys.stdout.buffer.flush()",
+            "# Keep the process alive so the test can observe the kill.",
+            "import time; time.sleep(30)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn write_no_response_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("no-response-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import sys, time",
+            "# Read the request header + body so the client's send_request",
+            "# completes, then deliberately hang. The client should",
+            "# trip MCP_REQUEST_TIMEOUT_SECS and kill us.",
+            "header = b''",
+            r"while not header.endswith(b'\r\n\r\n'):",
+            "    chunk = sys.stdin.buffer.read(1)",
+            "    if not chunk:",
+            "        raise SystemExit(0)",
+            "    header += chunk",
+            "length = 0",
+            r"for line in header.decode().split('\r\n'):",
+            r"    if line.lower().startswith('content-length:'):",
+            r"        length = int(line.split(':', 1)[1].strip())",
+            "sys.stdin.buffer.read(length)",
+            "time.sleep(30)",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn write_die_after_tools_list_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("die-after-tools-list.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "",
+            "def log(method):",
+            "    if LOG_PATH:",
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as handle:",
+            "            handle.write(f'{method}\\n')",
+            "",
+            "def read_message():",
+            "    header = b''",
+            r"    while not header.endswith(b'\r\n\r\n'):",
+            "        chunk = sys.stdin.buffer.read(1)",
+            "        if not chunk:",
+            "            return None",
+            "        header += chunk",
+            "    length = 0",
+            r"    for line in header.decode().split('\r\n'):",
+            r"        if line.lower().startswith('content-length:'):",
+            r"            length = int(line.split(':', 1)[1].strip())",
+            "    payload = sys.stdin.buffer.read(length)",
+            "    return json.loads(payload.decode())",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    log(method)",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'die-after-list', 'version': '0.1.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {",
+            "                        'name': 'echo',",
+            "                        'description': 'one-shot',",
+            "                        'inputSchema': {'type': 'object'}",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "        # Exit cleanly after the first tools/list reply so the",
+            "        # next manager call has to respawn.",
+            "        sys.exit(0)",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': f'unknown method: {method}'},",
+            "        })",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        make_executable(&script_path);
+        script_path
+    }
+
+    fn die_after_tools_list_config(
+        script_path: &Path,
+        log_path: &Path,
+    ) -> ScopedMcpServerConfig {
+        ScopedMcpServerConfig {
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: BTreeMap::from([(
+                    "MCP_LOG_PATH".to_string(),
+                    log_path.to_string_lossy().into_owned(),
+                )]),
+            }),
+        }
+    }
+
+    #[test]
+    fn rejects_response_with_mismatched_id() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_wrong_id_script();
+            let transport = script_transport(&script_path);
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn wrong-id server");
+
+            let err = process
+                .initialize(
+                    JsonRpcId::Number(1),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("id mismatch should error");
+
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("response id mismatch"),
+                "unexpected error: {err}"
+            );
+
+            // The child was killed by `request()` — wait() reaps it.
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn times_out_when_server_does_not_respond() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_no_response_script();
+            let transport = script_transport(&script_path);
+            let mut process = McpStdioProcess::spawn(&transport).expect("spawn hanging server");
+
+            // Set the env override *just before* the call and restore
+            // the previous value after. Tests are otherwise local IPC
+            // at sub-100ms latency, so a transient 1s ceiling can't
+            // cause false failures elsewhere.
+            let prior = std::env::var("MCP_REQUEST_TIMEOUT_SECS").ok();
+            std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", "1");
+            let started = std::time::Instant::now();
+            let err = process
+                .initialize(
+                    JsonRpcId::Number(1),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("hanging server should trigger timeout");
+            let elapsed = started.elapsed();
+            match prior {
+                Some(value) => std::env::set_var("MCP_REQUEST_TIMEOUT_SECS", value),
+                None => std::env::remove_var("MCP_REQUEST_TIMEOUT_SECS"),
+            }
+
+            assert_eq!(err.kind(), ErrorKind::TimedOut);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout fired too slowly: {elapsed:?}"
+            );
+
+            let _ = process.wait().await;
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_respawns_dead_server_on_next_discovery() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_die_after_tools_list_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("respawn.log");
+            let servers = BTreeMap::from([(
+                "ephemeral".to_string(),
+                die_after_tools_list_config(&script_path, &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // First discovery: server replies initialize + tools/list,
+            // then exits cleanly.
+            let first = manager.discover_tools().await.expect("first discover");
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].raw_name, "echo");
+
+            // Give the OS a moment to mark the child as exited so
+            // `try_wait()` returns `Ok(Some(_))` on the next call.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Second discovery must transparently respawn rather than
+            // hang on the dead pipe.
+            let second = manager.discover_tools().await.expect("respawn discover");
+            assert_eq!(second.len(), 1);
+
+            let log = fs::read_to_string(&log_path).expect("read log");
+            let initialize_count = log.lines().filter(|line| *line == "initialize").count();
+            assert_eq!(
+                initialize_count, 2,
+                "manager should have re-initialized after detecting the dead child; log was: {log}"
             );
 
             manager.shutdown().await.expect("shutdown");
