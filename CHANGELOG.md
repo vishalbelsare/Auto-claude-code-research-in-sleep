@@ -1,5 +1,47 @@
 # ARIS-Code Changelog
 
+## v0.4.8 (2026-05-17)
+
+The skill-helper subsystem rewrite. v0.4.7 was the last release where bundled helper scripts (`tools/*.py`, `templates/*.tex`) extracted into the user's current working directory and where SKILL.md files hardcoded `python3 tools/foo.py` paths that frequently silent-exit-2'd because `tools/` didn't exist there. v0.4.8 materialises the bundle into a versioned global cache (`~/.config/aris/cache/<version>/`), surfaces the materialisation report to the model on every Skill invocation, and ships a four-layer fallback chain documented in a new integration contract. Plus two community-reported bug fixes that landed on the way through.
+
+### 🚨 Fix
+
+- **gpt-5.5 / o3 / o4 + tools 400 on OpenAI** ([executor 400 bug](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues)) — Switching the executor to gpt-5.5 (or o3/o4) on `api.openai.com` caused immediate `OpenAI API error 400: Function tools with reasoning_effort are not supported for gpt-5.5 in /v1/chat/completions. Please use /v1/responses instead`. The intersection of `tools` + `reasoning_effort` + reasoning-model on the chat-completions endpoint is server-rejected. v0.4.5 added `reasoning_effort='xhigh'` for executor without realising the executor always sends `tools` (agent loop), and the bug shipped silent for reviewer because the LlmReview path doesn't send tools. v0.4.8 strips `reasoning_effort` on the gated path (gpt-5.5/5.6/o3*/o4* + tools + api.openai.com), with a one-shot stderr warning explaining the gate. Override via `ARIS_FORCE_REASONING_WITH_TOOLS=1` for compatible third-party proxies. Proper fix (OpenAI Responses API support) tracked for v0.4.9.
+
+- **Custom reviewer reset to gpt-5.5 every restart** (Windows-reported community bug) — `/setup` Custom reviewer (menu option 9) didn't persist `reviewer_model` because the model-selection branch in `config.rs` checked `reviewer_choice == "8"` (which is "Skip"), not `"9"`. Custom fell through to the else branch and set `reviewer_model = Some("")`, which round-tripped through config.json and reset the reviewer on every launch. Three layered fixes: (1) `config.rs:577` corrected to `"9"`, (2) `LlmReview` custom branch refuses to fall back to gpt-5.5 when the user has a Custom provider but model is empty — returns a clear error pointing to `/setup`, (3) `/reviewer` menu now shows "Custom reviewer configured" with current endpoint and model instead of the misleading "No reviewer API key found" error when items list is empty.
+
+### 🆕 New — skill-helper subsystem rewrite
+
+- **Global versioned cache** at `~/.config/aris/cache/<CARGO_PKG_VERSION>/` (Windows: `%USERPROFILE%\.config\aris\cache\<version>\`) — bundled helpers extract here at startup, not into cwd. `runtime::ExtractionReport` captures `extracted` / `failed` / `paths_tried` / `hard_error`; stored once in a `OnceLock` and accessible via `runtime::extraction_report()`. Atomic-replace via tmp-then-rename (Unix atomic, Windows first-writer-wins with content equality check — same bundle bytes = success). Falls back to `std::env::temp_dir()/aris-cache-<version>/` if home cache unavailable. Sets `$ARIS_CACHE_DIR` to the actually-used directory (or unsets it if both home and temp failed), forward-slash normalised for cross-platform shell compatibility.
+
+- **`SkillOutput.helperReport` field** — every Skill tool invocation now returns per-skill scoped extraction report (cache dir, available helpers with absolute paths, failed helpers with error messages, `cacheUsable` flag). Runtime injects a resolver-chain preamble in front of the SKILL.md prompt text so the model sees the four-layer fallback explicitly: active skill dir → `~/.config/aris/<bundle-key>` → `$ARIS_CACHE_DIR/<bundle-key>` → project workspace. Forward-slash normalised paths on Windows for shell compatibility.
+
+- **`/skills export` now copies bundled helpers** along with SKILL.md. Previously only the SKILL.md was exported; the filesystem skill then took precedence over the bundled one but lost its helpers (templates/, scripts/, etc.) — a silent regression. Now iterates `BUNDLED_RESOURCES` filtered by `skills/<canonical_name>/` prefix, preserves subdirectory structure, skips files that already exist (user edits survive re-export). Case-insensitive `find_skill_content` matching is now resolved to the canonical bundled name BEFORE building the export prefix, so `/skills export Research-Wiki` correctly lands at `~/.config/aris/skills/research-wiki/` with all helpers.
+
+- **8 shared cross-skill helpers bundled** into `assets/tools/`: `arxiv_fetch.py`, `deepxiv_fetch.py`, `exa_search.py`, `semantic_scholar_fetch.py`, `openalex_fetch.py`, `save_trace.sh`, `verify_papers.py`, `verify_paper_audits.sh`. Synced from main-branch ARIS. `BUNDLED_RESOURCES` count now 34 (17 shared-references + 9 skill-local + 8 shared tools).
+
+- **`shared-references/integration-contract.md`** — new canonical document for SKILL authors. Defines the 4-layer resolver chain and 6 failure policies (A gate / B side-effect / C forensic / D1 cascade / D2 multi-source / E diagnostic) for binding helper invocations to the cost of their silent failure. Adapted from main-branch ARIS contract but rewritten for aris-code's bundled-binary distribution. Skills authored after v0.4.8 should declare the policy of every helper invocation alongside the resolver block.
+
+- **`/research-lit` and `/deepxiv` migrated** to the canonical fallback chain as proof-of-concept (Policy D2 for /research-lit's three fetchers, D1 primary cascade for /deepxiv). The runtime resolver preamble covers other SKILL.md files in the meantime; full SKILL.md sweep (5+ remaining) tracked for v0.4.9.
+
+### 🛠 Build / internals
+
+- **build.rs recursive walk** — replaces flat `fs::read_dir` with `walkdir` traversal under `assets/tools/` and `assets/skills/<name>/`, preserving subdirectories. Strict namespace migration to three prefixes: `tools/<rel>`, `skills/<name>/<rel>`, `shared-references/<rel>`. Symlinks rejected at every level (top-level `assets/`, SKILL.md, recursive entries). WalkDir errors panic instead of silently filtering. Allow-listed extensions: `md`, `py`, `sh`, `tex`, `cls`, `bst`, `toml`, `yaml`, `yml`, `json`. 512KB per-file cap (allow-listed files exceeding cap panic at build time; never silently skipped). Sanitised OUT_DIR filenames include hash prefix to defeat key collisions.
+
+- **`skills-codex*` review-snapshot mirrors excluded** from BUNDLED_RESOURCES — `skills-codex/`, `skills-codex-claude-review/`, `skills-codex-gemini-review/` were accidentally getting README.md emitted into the bundle. They're review-format mirrors of the same skills, not user-facing — removing the noise saves ~thousands of would-be-entries if recursion were enabled. Users wanting them can clone the repo and copy under `~/.config/aris/skills/`.
+
+- **`paper-write/templates/`** (8 LaTeX files including 275KB IEEEtran.cls) now bundled correctly. The flat scanner in v0.4.7 silently dropped them; v0.4.8's recursive walker picks them up under `skills/paper-write/templates/` key prefix.
+
+### 🧹 Cleanup
+
+- **`bundled_resource()` vestigial getter** in `runtime/lib.rs` deleted. Zero workspace references (consumers iterate `BUNDLED_RESOURCES` directly). 9 lines down.
+
+- **`extract_bundled_helpers()` cwd-based extractor** in `tools/src/lib.rs` deleted. Startup eager extract via `runtime::extract_bundle` replaces it cleanly; cwd pollution gone.
+
+### Credits
+
+- Two community bug reports: gpt-5.5+tools 400 (executor) and Custom-reviewer-resets-to-gpt-5.5 (Windows). Thank you for the reproduction steps.
+
 ## v0.4.7 (2026-05-16)
 
 A community-driven release. [@GetIT-Sunday](https://github.com/GetIT-Sunday) followed through on the v0.4.5 commitment to land DashScope Coding Plan support and added a nice reasoning-content generalization on top of v0.4.5's `reasoning_effort='xhigh'` work. Bundled with a sweep of pre-rename dead code and a legacy branding cleanup.

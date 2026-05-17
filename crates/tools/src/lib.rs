@@ -1481,7 +1481,7 @@ fn inject_resolver_preamble(
         layer += 1;
     }
     preamble.push_str(&format!(
-        "{layer}. `~/.config/aris/skills/<name>/tools/<helper>` (user-customised location)\n"
+        "{layer}. `~/.config/aris/<bundle-key>` (user-customised location; e.g. `~/.config/aris/tools/foo.py` for shared helpers, `~/.config/aris/skills/<name>/<rel>` for skill-local)\n"
     ));
     layer += 1;
     preamble.push_str(&format!(
