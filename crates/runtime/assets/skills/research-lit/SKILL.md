@@ -140,18 +140,31 @@ Before searching online, check if the user already has relevant papers locally:
 
 **arXiv API search** (always runs, no download by default):
 
-Locate the fetch script and search arXiv directly:
+Locate the fetch script via the standard resolver chain
+(`shared-references/integration-contract.md` §1). Policy D2 — arXiv is
+one source in the aggregate; missing helper means skip this source,
+not abort:
 ```bash
-# Try to find arxiv_fetch.py
-SCRIPT=$(find tools/ -name "arxiv_fetch.py" 2>/dev/null | head -1)
-# If not found, check ARIS install
-[ -z "$SCRIPT" ] && SCRIPT=$(find ~/.claude/skills/arxiv/ -name "arxiv_fetch.py" 2>/dev/null | head -1)
+SCRIPT=""
+# Layer 2: user-customised aris install (highest precedence after Layer 1
+# which the SKILL preamble exposes as a literal path, see contract §1)
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/arxiv_fetch.py" ] && SCRIPT="$HOME/.config/aris/tools/arxiv_fetch.py"
+# Layer 3: aris-code v0.4.8+ bundled cache
+[ -z "$SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/arxiv_fetch.py" ] && SCRIPT="$ARIS_CACHE_DIR/tools/arxiv_fetch.py"
+# Layer 4: project workspace (in-repo run or main-branch ARIS install)
+[ -z "$SCRIPT" ] && [ -f "tools/arxiv_fetch.py" ] && SCRIPT="tools/arxiv_fetch.py"
+# Legacy: ~/.claude/skills/ layout
+[ -z "$SCRIPT" ] && [ -n "${HOME:-}" ] && SCRIPT=$(find "$HOME/.claude/skills/arxiv/" -name "arxiv_fetch.py" 2>/dev/null | head -1)
 
-# Search arXiv API for structured results (title, abstract, authors, categories)
-python3 "$SCRIPT" search "QUERY" --max 10
+if [ -n "$SCRIPT" ]; then
+  # Search arXiv API for structured results (title, abstract, authors, categories)
+  python3 "$SCRIPT" search "QUERY" --max 10
+else
+  echo "WARN: arxiv_fetch.py not found in any fallback layer; using WebSearch fallback" >&2
+fi
 ```
 
-If `arxiv_fetch.py` is not found, fall back to WebSearch for arXiv (same as before).
+If `arxiv_fetch.py` is not resolved, fall back to WebSearch for arXiv (same as before).
 
 The arXiv API returns structured metadata (title, abstract, full author list, categories, dates) — richer than WebSearch snippets. Merge these results with WebSearch findings and de-duplicate.
 
@@ -160,16 +173,22 @@ The arXiv API returns structured metadata (title, abstract, full author list, ca
 When the user explicitly requests `— sources: semantic-scholar` (or `— sources: web, semantic-scholar`), search for published venue papers beyond arXiv:
 
 ```bash
-S2_SCRIPT=$(find tools/ -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
-[ -z "$S2_SCRIPT" ] && S2_SCRIPT=$(find ~/.claude/skills/semantic-scholar/ -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
+S2_SCRIPT=""
+# Layer 2 → 3 → 4 → legacy, per contract §1
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/semantic_scholar_fetch.py" ] && S2_SCRIPT="$HOME/.config/aris/tools/semantic_scholar_fetch.py"
+[ -z "$S2_SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py" ] && S2_SCRIPT="$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py"
+[ -z "$S2_SCRIPT" ] && [ -f "tools/semantic_scholar_fetch.py" ] && S2_SCRIPT="tools/semantic_scholar_fetch.py"
+[ -z "$S2_SCRIPT" ] && [ -n "${HOME:-}" ] && S2_SCRIPT=$(find "$HOME/.claude/skills/semantic-scholar/" -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
 
-# Search for published CS/Engineering papers with quality filters
-python3 "$S2_SCRIPT" search "QUERY" --max 10 \
-  --fields-of-study "Computer Science,Engineering" \
-  --publication-types "JournalArticle,Conference"
+if [ -n "$S2_SCRIPT" ]; then
+  # Search for published CS/Engineering papers with quality filters
+  python3 "$S2_SCRIPT" search "QUERY" --max 10 \
+    --fields-of-study "Computer Science,Engineering" \
+    --publication-types "JournalArticle,Conference"
+fi
 ```
 
-If `semantic_scholar_fetch.py` is not found, skip silently.
+If `semantic_scholar_fetch.py` is not resolved at any layer, skip silently (Policy D2).
 
 **Why use Semantic Scholar?** Many IEEE/ACM journal papers are NOT on arXiv. S2 fills the gap for published venue-only papers with citation counts and venue metadata.
 
@@ -183,18 +202,29 @@ If `semantic_scholar_fetch.py` is not found, skip silently.
 When the user explicitly requests `— sources: deepxiv` (or includes `deepxiv` in a combined source list), use the DeepXiv adapter for progressive retrieval:
 
 ```bash
-python3 tools/deepxiv_fetch.py search "QUERY" --max 10
+DX_SCRIPT=""
+# Layer 2 → 3 → 4 → legacy, per contract §1
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/deepxiv_fetch.py" ] && DX_SCRIPT="$HOME/.config/aris/tools/deepxiv_fetch.py"
+[ -z "$DX_SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/deepxiv_fetch.py" ] && DX_SCRIPT="$ARIS_CACHE_DIR/tools/deepxiv_fetch.py"
+[ -z "$DX_SCRIPT" ] && [ -f "tools/deepxiv_fetch.py" ] && DX_SCRIPT="tools/deepxiv_fetch.py"
+[ -z "$DX_SCRIPT" ] && [ -n "${HOME:-}" ] && DX_SCRIPT=$(find "$HOME/.claude/skills/deepxiv/" -name "deepxiv_fetch.py" 2>/dev/null | head -1)
+
+if [ -n "$DX_SCRIPT" ]; then
+  python3 "$DX_SCRIPT" search "QUERY" --max 10
+fi
 ```
 
 Then deepen only for the most relevant papers:
 
 ```bash
-python3 tools/deepxiv_fetch.py paper-brief ARXIV_ID
-python3 tools/deepxiv_fetch.py paper-head ARXIV_ID
-python3 tools/deepxiv_fetch.py paper-section ARXIV_ID "Experiments"
+if [ -n "$DX_SCRIPT" ]; then
+  python3 "$DX_SCRIPT" paper-brief ARXIV_ID
+  python3 "$DX_SCRIPT" paper-head ARXIV_ID
+  python3 "$DX_SCRIPT" paper-section ARXIV_ID "Experiments"
+fi
 ```
 
-If `tools/deepxiv_fetch.py` or the `deepxiv` CLI is unavailable, skip this source gracefully and continue with the remaining requested sources.
+If `deepxiv_fetch.py` is unresolved in any layer (and the `deepxiv` CLI is also unavailable), skip this source gracefully and continue with the remaining requested sources (Policy D2).
 
 **Why use DeepXiv?** It is useful when a broad search should be followed by staged reading rather than immediate full-paper loading. This reduces unnecessary context while still surfacing structure, TLDRs, and the most relevant sections.
 

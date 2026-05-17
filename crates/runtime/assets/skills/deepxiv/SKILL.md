@@ -63,22 +63,42 @@ Parse `$ARGUMENTS` for:
 
 If the main argument looks like an arXiv ID and no explicit mode is given, default to `- brief`.
 
-### Step 2: Locate the Adapter
+### Step 2: Locate the Adapter (Policy D1 — primary cascade)
 
-Prefer the ARIS adapter:
+Resolve `deepxiv_fetch.py` via the standard fallback chain
+(`shared-references/integration-contract.md` §1). Below uses `$DX` as
+the resolved path:
 
 ```bash
-python3 tools/deepxiv_fetch.py --help
+DX=""
+# Order per integration-contract.md §1: Layer 2 > Layer 3 > Layer 4 > legacy
+# (Layer 1 = active_skill_dir is exposed via the runtime preamble as a
+# literal path, not via env var; bundled skills have no Layer 1.)
+# Layer 2: user-customised aris install (takes precedence over cache so the
+# user can override individual helpers without re-bundling)
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/deepxiv_fetch.py" ] && DX="$HOME/.config/aris/tools/deepxiv_fetch.py"
+# Layer 3: aris-code v0.4.8+ bundled cache
+[ -z "$DX" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/deepxiv_fetch.py" ] && DX="$ARIS_CACHE_DIR/tools/deepxiv_fetch.py"
+# Layer 4: project workspace
+[ -z "$DX" ] && [ -f "tools/deepxiv_fetch.py" ] && DX="tools/deepxiv_fetch.py"
+# Legacy: ~/.claude/skills/ layout
+[ -z "$DX" ] && [ -n "${HOME:-}" ] && DX=$(find "$HOME/.claude/skills/deepxiv/" -name "deepxiv_fetch.py" 2>/dev/null | head -1)
+
+if [ -n "$DX" ]; then
+  python3 "$DX" --help
+fi
 ```
 
-If `tools/deepxiv_fetch.py` is not available, fall back to raw `deepxiv` commands.
+If `$DX` is empty, the SKILL still proceeds via raw `deepxiv` CLI commands as a primary cascade fallback.
 
 ### Step 3: Execute the Minimal Command
 
 **Search papers**
 
 ```bash
-python3 tools/deepxiv_fetch.py search "QUERY" --max MAX_RESULTS
+if [ -n "$DX" ]; then
+  python3 "$DX" search "QUERY" --max MAX_RESULTS
+fi
 ```
 
 Fallback:
@@ -90,7 +110,9 @@ deepxiv search "QUERY" --limit MAX_RESULTS --format json
 **Brief summary**
 
 ```bash
-python3 tools/deepxiv_fetch.py paper-brief ARXIV_ID
+if [ -n "$DX" ]; then
+  python3 "$DX" paper-brief ARXIV_ID
+fi
 ```
 
 Fallback:
@@ -102,7 +124,7 @@ deepxiv paper ARXIV_ID --brief --format json
 **Section map**
 
 ```bash
-python3 tools/deepxiv_fetch.py paper-head ARXIV_ID
+if [ -n "$DX" ]; then python3 "$DX" paper-head ARXIV_ID; fi
 ```
 
 Fallback:
@@ -114,7 +136,7 @@ deepxiv paper ARXIV_ID --head --format json
 **Specific section**
 
 ```bash
-python3 tools/deepxiv_fetch.py paper-section ARXIV_ID "SECTION_NAME"
+if [ -n "$DX" ]; then python3 "$DX" paper-section ARXIV_ID "SECTION_NAME"; fi
 ```
 
 Fallback:
@@ -126,7 +148,7 @@ deepxiv paper ARXIV_ID --section "SECTION_NAME" --format json
 **Trending**
 
 ```bash
-python3 tools/deepxiv_fetch.py trending --days 7 --max MAX_RESULTS
+if [ -n "$DX" ]; then python3 "$DX" trending --days 7 --max MAX_RESULTS; fi
 ```
 
 Fallback:
@@ -138,7 +160,7 @@ deepxiv trending --days 7 --limit MAX_RESULTS --output json
 **Web search**
 
 ```bash
-python3 tools/deepxiv_fetch.py wsearch "QUERY"
+if [ -n "$DX" ]; then python3 "$DX" wsearch "QUERY"; fi
 ```
 
 Fallback:
@@ -150,7 +172,7 @@ deepxiv wsearch "QUERY" --output json
 **Semantic Scholar metadata**
 
 ```bash
-python3 tools/deepxiv_fetch.py sc "SEMANTIC_SCHOLAR_ID"
+if [ -n "$DX" ]; then python3 "$DX" sc "SEMANTIC_SCHOLAR_ID"; fi
 ```
 
 Fallback:
