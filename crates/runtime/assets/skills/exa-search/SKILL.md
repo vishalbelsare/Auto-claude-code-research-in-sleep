@@ -71,17 +71,28 @@ Parse `$ARGUMENTS` for:
 - **end date**: ISO 8601 date — only results before this
 - **location**: Two-letter ISO country code
 
-### Step 2: Locate Script
+### Step 2: Locate Script (Policy A — gate)
+
+Resolve via the standard fallback chain (`shared-references/integration-contract.md` §1). Missing helper aborts this skill because there is no graceful alternative search backend within /exa-search.
 
 ```bash
-SCRIPT=$(find tools/ -name "exa_search.py" 2>/dev/null | head -1)
+SCRIPT=""
+# Layer 2: user-customised
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/exa_search.py" ] && SCRIPT="$HOME/.config/aris/tools/exa_search.py"
+# Layer 3: aris-code bundled cache (v0.4.8+)
+[ -z "$SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/exa_search.py" ] && SCRIPT="$ARIS_CACHE_DIR/tools/exa_search.py"
+# Layer 4: project workspace
+[ -z "$SCRIPT" ] && [ -f "tools/exa_search.py" ] && SCRIPT="tools/exa_search.py"
+# Legacy: ~/.claude/skills/
+[ -z "$SCRIPT" ] && [ -n "${HOME:-}" ] && SCRIPT=$(find "$HOME/.claude/skills/exa-search/" -name "exa_search.py" 2>/dev/null | head -1)
 ```
 
-If not found, tell the user:
+If `$SCRIPT` is empty after the chain, tell the user:
 ```
-exa_search.py not found. Make sure tools/exa_search.py exists and exa-py is installed:
-pip install exa-py
+exa_search.py not found in any fallback layer ($ARIS_CACHE_DIR/tools/, ~/.config/aris/tools/, tools/, ~/.claude/skills/exa-search/).
+Ensure exa-py is installed: pip install exa-py
 ```
+Then abort this skill (Policy A — gate).
 
 ### Step 3: Execute Search
 

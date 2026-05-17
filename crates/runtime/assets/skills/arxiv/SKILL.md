@@ -37,17 +37,27 @@ If the argument matches an arXiv ID pattern (`YYMM.NNNNN` or `category/NNNNNNN`)
 
 ### Step 2: Search arXiv
 
-Locate the fetch script:
+Locate the fetch script via the standard fallback chain
+(`shared-references/integration-contract.md` §1). Policy D1 — primary
+cascade: if no script resolves, the SKILL falls through to the inline
+Python block below.
 
 ```bash
 SCRIPT=$(python3 -c "
-import pathlib
+import os, pathlib
+cache_dir = os.environ.get('ARIS_CACHE_DIR') or ''
 candidates = [
+    # Layer 2: user-customised aris install
+    pathlib.Path.home() / '.config' / 'aris' / 'tools' / 'arxiv_fetch.py',
+    # Layer 3: aris-code v0.4.8+ bundled cache
+    pathlib.Path(cache_dir) / 'tools' / 'arxiv_fetch.py' if cache_dir else None,
+    # Layer 4: project workspace
     pathlib.Path('tools/arxiv_fetch.py'),
+    # Legacy: ~/.claude/skills/
     pathlib.Path.home() / '.claude' / 'skills' / 'arxiv' / 'arxiv_fetch.py',
 ]
 for p in candidates:
-    if p.exists():
+    if p and p.exists():
         print(p)
         break
 " 2>/dev/null)

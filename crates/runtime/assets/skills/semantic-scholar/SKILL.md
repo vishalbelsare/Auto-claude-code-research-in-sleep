@@ -60,11 +60,17 @@ If the argument matches a DOI pattern (`10.XXXX/...`), a Semantic Scholar ID (40
 
 ### Step 2: Search Papers
 
-Locate the fetch script:
+Locate the fetch script via the standard fallback chain
+(`shared-references/integration-contract.md` §1). Policy D1 — primary
+cascade: if the script is missing in every layer, fall through to the
+inline-Python fallback documented later in this file (line ~92).
 
 ```bash
-SCRIPT=$(find tools/ -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
-[ -z "$SCRIPT" ] && SCRIPT=$(find ~/.claude/skills/semantic-scholar/ -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
+SCRIPT=""
+[ -n "${HOME:-}" ] && [ -f "$HOME/.config/aris/tools/semantic_scholar_fetch.py" ] && SCRIPT="$HOME/.config/aris/tools/semantic_scholar_fetch.py"
+[ -z "$SCRIPT" ] && [ -n "${ARIS_CACHE_DIR:-}" ] && [ -f "$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py" ] && SCRIPT="$ARIS_CACHE_DIR/tools/semantic_scholar_fetch.py"
+[ -z "$SCRIPT" ] && [ -f "tools/semantic_scholar_fetch.py" ] && SCRIPT="tools/semantic_scholar_fetch.py"
+[ -z "$SCRIPT" ] && [ -n "${HOME:-}" ] && SCRIPT=$(find "$HOME/.claude/skills/semantic-scholar/" -name "semantic_scholar_fetch.py" 2>/dev/null | head -1)
 ```
 
 **Standard search** (default — relevance-ranked):
