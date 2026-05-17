@@ -736,6 +736,46 @@ struct SkillOutput {
     args: Option<String>,
     description: Option<String>,
     prompt: String,
+
+    /// v0.4.8: per-skill slice of `runtime::ExtractionReport`. `None` for
+    /// filesystem skills (no bundled helpers) or when startup eager-extract
+    /// was bypassed (test code).
+    #[serde(rename = "helperReport", skip_serializing_if = "Option::is_none")]
+    helper_report: Option<SkillHelperReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillHelperReport {
+    /// Absolute path to the cache root (set as `$ARIS_CACHE_DIR` at startup).
+    /// `None` iff `runtime::ExtractionReport.hard_error` — helpers unavailable.
+    #[serde(rename = "cacheDir", skip_serializing_if = "Option::is_none")]
+    cache_dir: Option<String>,
+
+    /// True iff `cache_dir.is_some() && failed_helpers.is_empty()`.
+    /// False under partial failure even if `cache_dir` is set.
+    #[serde(rename = "cacheUsable")]
+    cache_usable: bool,
+
+    /// Helpers visible to this skill (shared `tools/*` + skill-local +
+    /// always-extracted `shared-references/*`). Absolute paths.
+    #[serde(rename = "availableHelpers")]
+    available_helpers: Vec<HelperEntry>,
+
+    /// Helpers from BUNDLED_RESOURCES that failed to extract.
+    /// v0.4.8 scope: extraction-failure slice. NOT "SKILL.md references that
+    /// aren't bundled" — that static inference is deferred to v0.5.0.
+    #[serde(rename = "failedHelpers")]
+    failed_helpers: Vec<HelperEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperEntry {
+    /// Bundle key (e.g., "tools/arxiv_fetch.py", "skills/research-wiki/research_wiki.py").
+    key: String,
+    /// Absolute path where the helper lives, or where it would have lived if missing.
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1296,29 +1336,46 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
 
     // Try filesystem search roots first (user overrides take priority)
     if let Ok(skill_path) = resolve_skill_path(requested) {
-        let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
-        let description = parse_skill_description(&prompt);
+        let raw_prompt = std::fs::read_to_string(&skill_path).map_err(|e| e.to_string())?;
+        let description = parse_skill_description(&raw_prompt);
+        let helper_report = build_helper_report(requested);
+        // Active filesystem skill dir = parent of SKILL.md. Used by the
+        // resolver chain's Layer 1 (`<active_skill_dir>/tools/<helper>`).
+        let active_skill_dir = skill_path
+            .parent()
+            .map(|p| forward_slash(&p.display().to_string()));
+        let prompt = inject_resolver_preamble(
+            &raw_prompt,
+            helper_report.as_ref(),
+            active_skill_dir.as_deref(),
+        );
         return Ok(SkillOutput {
             skill: input.skill,
             path: skill_path.display().to_string(),
             args: input.args,
             description,
             prompt,
+            helper_report,
         });
     }
 
-    // Fallback: bundled skills compiled into the binary
+    // Fallback: bundled skills compiled into the binary.
+    // No per-skill extraction here — startup eager extract (runtime::extract_bundle)
+    // already materialised every BUNDLED_RESOURCES entry into the cache. We just
+    // surface a per-skill slice of the report so the model knows where helpers live.
     for (name, content) in BUNDLED_SKILLS {
         if name.eq_ignore_ascii_case(requested) {
-            // Auto-extract bundled helper files (.py/.sh) to working directory
-            extract_bundled_helpers(name);
             let description = parse_skill_description(content);
+            let helper_report = build_helper_report(name);
+            // Bundled skills have no on-disk skill dir; Layer 1 doesn't apply.
+            let prompt = inject_resolver_preamble(content, helper_report.as_ref(), None);
             return Ok(SkillOutput {
                 skill: input.skill,
                 path: format!("<bundled:{name}>"),
                 args: input.args,
                 description,
-                prompt: content.to_string(),
+                prompt,
+                helper_report,
             });
         }
     }
@@ -1326,39 +1383,136 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     Err(format!("unknown skill: {requested}"))
 }
 
-/// Extract bundled helper files for a skill to the skill's working directory (cwd).
+/// Normalise a path string to forward slashes. The cache and active-skill paths
+/// flow into SKILL.md prompts and from there into the model's `bash` tool
+/// invocations. POSIX-shell + git-bash + WSL all tolerate `/` even on Windows;
+/// raw backslashes from `Path::display()` confuse the shell escaping.
+fn forward_slash(p: &str) -> String {
+    p.replace('\\', "/")
+}
+
+/// Build the per-skill slice of the process-global `ExtractionReport`.
 ///
-/// v0.4.8 transitional: BUNDLED_RESOURCES key namespace migrated to
-/// `tools/<rel>` / `skills/<name>/<rel>` / `shared-references/<rel>`.
-/// This function still extracts to cwd; the full cache-dir migration lands in a
-/// follow-up step (T5 cache module + T6 SkillOutput.helper_report).
-fn extract_bundled_helpers(skill_name: &str) {
-    // Always extract shared-references/ on any skill invocation
-    let shared_prefix = "shared-references/";
-    for (key, content) in runtime::BUNDLED_RESOURCES {
-        if let Some(filename) = key.strip_prefix(shared_prefix) {
-            let target_dir = std::path::PathBuf::from("shared-references");
-            let target_path = target_dir.join(filename);
-            if !target_path.exists() {
-                let _ = std::fs::create_dir_all(target_path.parent().unwrap_or(&target_dir));
-                let _ = std::fs::write(&target_path, content);
-            }
-        }
-    }
-    // Extract skill-local helpers. Key shape: "skills/<skill_name>/<rel>".
+/// Helpers in scope: shared (`tools/*`), always-extracted refs
+/// (`shared-references/*`), and skill-local (`skills/<skill_name>/*`).
+fn build_helper_report(skill_name: &str) -> Option<SkillHelperReport> {
+    let report = runtime::extraction_report()?;
+
+    let cache_dir = report
+        .used_dir
+        .as_ref()
+        .map(|p| forward_slash(&p.display().to_string()));
+
     let skill_prefix = format!("skills/{skill_name}/");
-    for (key, content) in runtime::BUNDLED_RESOURCES {
-        if let Some(rel) = key.strip_prefix(&skill_prefix) {
-            // Write to <cwd>/<skill_name>/<rel>, preserving subdirs (e.g. templates/).
-            let target_dir = std::path::PathBuf::from(skill_name);
-            let target_path = target_dir.join(rel);
-            if !target_path.exists() {
-                let _ =
-                    std::fs::create_dir_all(target_path.parent().unwrap_or(&target_dir));
-                let _ = std::fs::write(&target_path, content);
-            }
+    let in_scope = |key: &str| -> bool {
+        key.starts_with("tools/")
+            || key.starts_with("shared-references/")
+            || key.starts_with(&skill_prefix)
+    };
+
+    let make_path = |key: &str| -> String {
+        report
+            .used_dir
+            .as_ref()
+            .map(|d| forward_slash(&d.join(key).display().to_string()))
+            .unwrap_or_default()
+    };
+
+    let available_helpers: Vec<HelperEntry> = report
+        .extracted
+        .iter()
+        .filter(|k| in_scope(k))
+        .map(|k| HelperEntry {
+            key: k.clone(),
+            path: make_path(k),
+            error: None,
+        })
+        .collect();
+
+    let failed_helpers: Vec<HelperEntry> = report
+        .failed
+        .iter()
+        .filter(|e| in_scope(&e.key))
+        .map(|e| HelperEntry {
+            key: e.key.clone(),
+            path: make_path(&e.key),
+            error: Some(e.error.clone()),
+        })
+        .collect();
+
+    let cache_usable = cache_dir.is_some() && failed_helpers.is_empty();
+
+    Some(SkillHelperReport {
+        cache_dir,
+        cache_usable,
+        available_helpers,
+        failed_helpers,
+    })
+}
+
+/// Prepend a hard resolver preamble to the SKILL.md prompt so the model knows
+/// how to resolve helper paths. This is the bridge while SKILL.md bodies (T15)
+/// still use legacy `tools/<helper>` hardcoded paths.
+///
+/// `active_skill_dir` should be `Some(dirname(skill_md))` for filesystem skills,
+/// `None` for bundled skills (Layer 1 omitted).
+fn inject_resolver_preamble(
+    prompt: &str,
+    report: Option<&SkillHelperReport>,
+    active_skill_dir: Option<&str>,
+) -> String {
+    let Some(report) = report else {
+        return prompt.to_string();
+    };
+    let Some(cache_dir) = &report.cache_dir else {
+        // No usable cache — preamble omitted; SKILL.md must rely on
+        // project-workspace fallback at layer 4.
+        return prompt.to_string();
+    };
+
+    let mut preamble = String::with_capacity(1024 + prompt.len());
+    preamble.push_str("# Helper resolution (ARIS-Code v0.4.8+)\n\n");
+    preamble.push_str("When invoking a bundled helper script, resolve its path via this fallback chain (in order, first hit wins):\n\n");
+    let mut layer = 1u32;
+    if let Some(dir) = active_skill_dir {
+        preamble.push_str(&format!(
+            "{layer}. `{dir}/tools/<helper>` (active filesystem skill dir, where this SKILL.md lives)\n"
+        ));
+        layer += 1;
+    }
+    preamble.push_str(&format!(
+        "{layer}. `~/.config/aris/skills/<name>/tools/<helper>` (user-customised location)\n"
+    ));
+    layer += 1;
+    preamble.push_str(&format!(
+        "{layer}. `{cache_dir}/<bundle-key>` (bundled fallback for this binary; also accessible as `$ARIS_CACHE_DIR/<bundle-key>`)\n"
+    ));
+    layer += 1;
+    preamble.push_str(&format!(
+        "{layer}. `<project_root>/tools/<helper>` (legacy compat with main-branch ARIS layouts)\n\n"
+    ));
+
+    if report.available_helpers.is_empty() {
+        preamble.push_str("No bundled helpers extracted for this skill.\n");
+    } else {
+        preamble.push_str("Bundled helpers available for this skill (cache layer):\n");
+        for entry in &report.available_helpers {
+            preamble.push_str(&format!("- `{}` → `{}`\n", entry.key, entry.path));
         }
     }
+    if !report.failed_helpers.is_empty() {
+        preamble.push_str("\nWarning: the following bundled helpers failed to extract and may be unavailable:\n");
+        for entry in &report.failed_helpers {
+            preamble.push_str(&format!(
+                "- `{}` — {}\n",
+                entry.key,
+                entry.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+    preamble.push_str("\n---\n\n");
+    preamble.push_str(prompt);
+    preamble
 }
 
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {

@@ -161,7 +161,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // spawn child processes. See idea-stage/v0.4.8/T1_cache_design.md.
     let report = runtime::extract_bundle();
     if let Some(dir) = &report.used_dir {
-        env::set_var("ARIS_CACHE_DIR", dir);
+        // Forward-slash normalise on Windows so SKILL.md bash blocks (POSIX
+        // shell under git-bash / WSL) and the T6 resolver preamble see the
+        // same shape. Rust + Windows API accept `/` in paths, so fs ops still
+        // work; only the env var representation changes.
+        let dir_str = dir.display().to_string().replace('\\', "/");
+        env::set_var("ARIS_CACHE_DIR", dir_str);
     } else {
         env::remove_var("ARIS_CACHE_DIR");
     }
