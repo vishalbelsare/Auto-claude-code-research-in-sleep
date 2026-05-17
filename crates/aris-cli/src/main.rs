@@ -1235,12 +1235,31 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
         )?;
-        // Determine default reviewer model
+        // Determine default reviewer model. saved_config.apply_to_env() runs
+        // BEFORE this point in run(), so when a user has persisted
+        // reviewer_model in config.json we read it back via the
+        // ARIS_REVIEWER_MODEL env var. The fallback only fires when no model
+        // has been persisted (first run / config load failed).
+        //
+        // v0.4.8: when the user has a Custom reviewer provider configured
+        // (ARIS_REVIEWER_PROVIDER=custom + auth token), don't fall back to
+        // gpt-5.5 — that's surely the wrong default for a custom proxy. Warn
+        // and leave the field empty so LlmReview's Custom branch hard-errors
+        // with a clear message instead of silently routing to gpt-5.5.
+        let has_custom_reviewer_provider =
+            std::env::var("ARIS_REVIEWER_PROVIDER").as_deref() == Ok("custom")
+                && std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_ok();
         let reviewer_model = std::env::var("ARIS_REVIEWER_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
-                if std::env::var("GEMINI_API_KEY").is_ok() {
+                if has_custom_reviewer_provider {
+                    eprintln!(
+                        "\x1b[33mwarning:\x1b[0m custom reviewer provider configured but \
+                         model name is empty in config. Run /setup or /reviewer <model-name>."
+                    );
+                    String::new()
+                } else if std::env::var("GEMINI_API_KEY").is_ok() {
                     "gemini-2.5-pro".to_string()
                 } else {
                     "gpt-5.5".to_string()
@@ -1797,6 +1816,16 @@ impl LiveCli {
             None => {
                 let has_gemini = std::env::var("GEMINI_API_KEY").is_ok();
                 let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
+                // Custom OpenAI-compatible reviewer: API key lives in
+                // ARIS_REVIEWER_AUTH_TOKEN (not OPENAI_API_KEY, deliberately
+                // separate to avoid colliding with the executor's key). The
+                // bare `/reviewer` menu used to miss this entirely and tell
+                // users "No reviewer API key found" even when they had just
+                // configured a custom provider.
+                let has_custom_reviewer = std::env::var("ARIS_REVIEWER_PROVIDER")
+                    .as_deref()
+                    == Ok("custom")
+                    && std::env::var("ARIS_REVIEWER_AUTH_TOKEN").is_ok();
 
                 let mut items: Vec<input::SelectItem> = Vec::new();
                 if has_gemini {
@@ -1869,8 +1898,26 @@ impl LiveCli {
                 }
 
                 if items.is_empty() {
-                    // No known API keys set — could be a custom provider or no config.
-                    // Allow the user to type a model name directly.
+                    if has_custom_reviewer {
+                        // Custom provider is configured but we can't enumerate
+                        // its model catalog. Show the current model and tell
+                        // the user how to change it (`/reviewer <model-name>`).
+                        let current = std::env::var("ARIS_REVIEWER_MODEL")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| self.reviewer_model.clone());
+                        let base_url = std::env::var("ARIS_REVIEWER_BASE_URL")
+                            .ok()
+                            .unwrap_or_else(|| "(not set)".to_string());
+                        println!(
+                            "\x1b[1mCustom reviewer configured\x1b[0m\n  Endpoint  {base_url}\n  Model     \x1b[1;32m{current}\x1b[0m"
+                        );
+                        println!(
+                            "  \x1b[2mType '/reviewer <model-name>' to change, or '/setup' to re-enter API key / endpoint.\x1b[0m"
+                        );
+                        return Ok(false);
+                    }
+                    // No known API keys set — guide the user to /setup.
                     println!("No reviewer API key found. Set GEMINI_API_KEY, OPENAI_API_KEY, or use /setup to configure a custom provider.");
                     println!("  You can also type: /reviewer <model-name>");
                     return Ok(false);

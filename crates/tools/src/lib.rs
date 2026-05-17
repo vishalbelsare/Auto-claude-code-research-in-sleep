@@ -3432,11 +3432,20 @@ fn run_llm_review(input: LlmReviewInput) -> Result<String, String> {
             .ok()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| "LlmReview: ARIS_REVIEWER_AUTH_TOKEN not set (needed for custom reviewer)".to_string())?;
+        // For Custom reviewer, refuse to fall back to gpt-5.5 — that would
+        // silently send the user's request to the wrong model on their custom
+        // proxy. Require explicit model from input or ARIS_REVIEWER_MODEL.
         let model = input
             .model
             .as_deref()
             .filter(|s| !s.is_empty())
-            .unwrap_or(configured_model);
+            .or(env_reviewer_model.as_deref())
+            .ok_or_else(|| {
+                "LlmReview: custom reviewer has no model configured. \
+                 Set ARIS_REVIEWER_MODEL or run /setup → reviewer → Custom and \
+                 provide a model name."
+                    .to_string()
+            })?;
         let base = custom_base_url.ok_or_else(|| {
             "LlmReview: ARIS_REVIEWER_BASE_URL not set (needed for custom reviewer)".to_string()
         })?;

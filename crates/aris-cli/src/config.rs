@@ -568,7 +568,13 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
         }
 
         // Auto-set best model for the chosen reviewer provider
-        if reviewer_choice == "8" {
+        // v0.4.8 fix: Custom is menu option 9, not 8 (8 is "Skip"). The
+        // previous "8" check meant Custom fell through to the else branch
+        // (`reviewer_model = Some(default_model)` = `Some("")` since custom's
+        // default_model is the empty string), which then persisted in
+        // config.json and caused every reboot to reset reviewer to the
+        // gpt-5.5 fallback chain in main.rs.
+        if reviewer_choice == "9" {
             // Custom provider: try fetching available models from /models endpoint
             let api_key = config.reviewer_api_key.as_deref().unwrap_or("");
             let base_url = config.reviewer_base_url.as_deref().unwrap_or("");
