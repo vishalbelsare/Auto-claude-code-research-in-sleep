@@ -51,10 +51,34 @@ impl UsageCostEstimate {
     }
 }
 
+/// Look up per-token pricing for a model. Returns `None` when the model
+/// string doesn't match any known family — callers then fall back to a
+/// generic Sonnet-tier estimate with `pricing=estimated-default` suffix.
+///
+/// v0.4.10 (C9 landmine) extended this from "Claude only" to cover the
+/// major OpenAI / Gemini / DeepSeek / GLM / MiniMax / Kimi / Xiaomi /
+/// Qwen / Doubao families that ARIS-Code already routes to. Prices are
+/// USD per million tokens, sourced from each provider's published list
+/// at the time of bundling (2026-05). They will drift; treat `/cost`
+/// as a rough estimate, not billing-grade.
+///
+/// Cache-tier handling per provider:
+/// - **Anthropic**: distinct cache_creation (1.25x input) and cache_read
+///   (0.1x input) tiers per the public schedule.
+/// - **OpenAI**: automatic prefix-cache; reads billed at 10% of input,
+///   no separate write tier (`cache_creation` = `input`).
+/// - **DeepSeek V3/V4**: explicit cache-hit / cache-miss pricing in the
+///   docs; we use cache-miss rate for `input`/`cache_creation`,
+///   cache-hit rate (~10% of input for V4) for `cache_read`.
+/// - **All others (Gemini, GLM, MiniMax, Kimi, MiMo, Qwen, Doubao)**:
+///   no exposed cache billing; cache_creation = input, cache_read =
+///   input/2 (a generic optimistic default).
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("haiku") {
+    let m = model.to_ascii_lowercase();
+
+    // ── Anthropic Claude family ──────────────────────────────────
+    if m.contains("haiku") {
         return Some(ModelPricing {
             input_cost_per_million: 1.0,
             output_cost_per_million: 5.0,
@@ -62,7 +86,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 0.1,
         });
     }
-    if normalized.contains("opus") {
+    if m.contains("opus") {
         return Some(ModelPricing {
             input_cost_per_million: 15.0,
             output_cost_per_million: 75.0,
@@ -70,10 +94,180 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 1.5,
         });
     }
-    if normalized.contains("sonnet") {
+    if m.contains("sonnet") {
         return Some(ModelPricing::default_sonnet_tier());
     }
+
+    // ── OpenAI families ──────────────────────────────────────────
+    // Public price list as of 2026-05. cache_read = 10% of input
+    // (OpenAI's documented automatic-prefix-cache discount).
+    if m.contains("gpt-5.5") {
+        return Some(openai_pricing(5.0, 30.0));
+    }
+    if m.contains("gpt-5.4-nano") {
+        return Some(openai_pricing(0.20, 1.25));
+    }
+    if m.contains("gpt-5.4-mini") {
+        return Some(openai_pricing(0.75, 4.5));
+    }
+    if m.contains("gpt-5.4") {
+        return Some(openai_pricing(2.5, 15.0));
+    }
+    if m.contains("gpt-4o-mini") {
+        return Some(openai_pricing(0.15, 0.6));
+    }
+    if m.contains("gpt-4o") {
+        return Some(openai_pricing(2.5, 10.0));
+    }
+    // o-series reasoning models — match on word boundary to avoid
+    // false-positives like "google/o3" being prefix-matched on a
+    // provider-prefixed model string.
+    if has_word(&m, "o4") {
+        return Some(openai_pricing(4.0, 16.0));
+    }
+    if has_word(&m, "o3") {
+        return Some(openai_pricing(2.0, 8.0));
+    }
+    if has_word(&m, "o1") {
+        return Some(openai_pricing(15.0, 60.0));
+    }
+
+    // ── Google Gemini ────────────────────────────────────────────
+    // Gemini Pro pricing is context-window-tiered (prompts ≤200K vs
+    // >200K). We list the small-context tier; long-context users will
+    // see /cost as an under-estimate. Tracked for v0.5.0 (full
+    // context-aware pricing matrix).
+    if m.contains("gemini-2.5-flash") {
+        return Some(generic_pricing(0.3, 2.5));
+    }
+    if m.contains("gemini-2.5-pro") {
+        return Some(generic_pricing(2.5, 10.0));
+    }
+    if m.contains("gemini-2.0-flash") {
+        return Some(generic_pricing(0.1, 0.4));
+    }
+
+    // ── DeepSeek ────────────────────────────────────────────────
+    // V3 / V4 / R1 expose explicit cache hit vs miss rates. cache_read =
+    // cache-hit rate; input/cache_creation = cache-miss rate.
+    //
+    // NOTE: DeepSeek V4 currently ships in Flash and Pro tiers with
+    // distinct rates; ARIS-Code v0.4.10 collapses both onto the
+    // V3-equivalent cache-miss schedule (0.27 / 1.10 / cache-hit 0.07)
+    // pending a context-aware pricing matrix in v0.5.0. Treat /cost
+    // as a rough estimate for V4-Pro users; V4-Flash should be close.
+    if m.contains("deepseek-v4") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.27,
+            output_cost_per_million: 1.10,
+            cache_creation_cost_per_million: 0.27,
+            cache_read_cost_per_million: 0.07,
+        });
+    }
+    if m.contains("deepseek-v3") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.27,
+            output_cost_per_million: 1.10,
+            cache_creation_cost_per_million: 0.27,
+            cache_read_cost_per_million: 0.07,
+        });
+    }
+    // DeepSeek-R1: only match the deepseek-prefixed name, NOT bare
+    // "*-reasoner" which would catch other providers' reasoners.
+    if m.contains("deepseek-r1") || m.contains("deepseek-reasoner") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.55,
+            output_cost_per_million: 2.19,
+            cache_creation_cost_per_million: 0.55,
+            cache_read_cost_per_million: 0.14,
+        });
+    }
+    if m.contains("deepseek") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.27,
+            output_cost_per_million: 1.10,
+            cache_creation_cost_per_million: 0.27,
+            cache_read_cost_per_million: 0.07,
+        });
+    }
+
+    // ── Other Chinese providers ─────────────────────────────────
+    // No exposed cache-tier billing — generic_pricing (cache_read =
+    // input/2, cache_creation = input).
+    if m.contains("glm") {
+        return Some(generic_pricing(0.5, 2.0));
+    }
+    if m.contains("minimax") {
+        return Some(generic_pricing(0.6, 2.4));
+    }
+    if m.contains("kimi") || m.contains("moonshot") {
+        return Some(generic_pricing(0.6, 2.5));
+    }
+    if m.contains("mimo") {
+        return Some(generic_pricing(0.4, 1.6));
+    }
+    if m.contains("qwen") {
+        return Some(generic_pricing(0.4, 1.6));
+    }
+    if m.contains("doubao") {
+        return Some(generic_pricing(0.3, 1.2));
+    }
+
     None
+}
+
+/// OpenAI pricing helper. cache_read = 10% of input — OpenAI's
+/// documented automatic-prefix-cache discount (e.g. GPT-5.5 input 5.0
+/// → cached input 0.50; GPT-5.4 2.5 → 0.25; -mini 0.75 → 0.075).
+/// Previously this was input/2; Codex audit caught the mismatch.
+/// cache_creation = input (OpenAI bills writes at the regular input
+/// rate since caching is silent / automatic).
+fn openai_pricing(input: f64, output: f64) -> ModelPricing {
+    ModelPricing {
+        input_cost_per_million: input,
+        output_cost_per_million: output,
+        cache_creation_cost_per_million: input,
+        cache_read_cost_per_million: input * 0.1,
+    }
+}
+
+/// Generic pricing fallback for providers that don't publish a separate
+/// cache-tier rate. Approximates with cache_read = input/2 (optimistic;
+/// real billing is at full input rate unless the provider quietly
+/// supports prefix caching). cache_creation = input.
+fn generic_pricing(input: f64, output: f64) -> ModelPricing {
+    ModelPricing {
+        input_cost_per_million: input,
+        output_cost_per_million: output,
+        cache_creation_cost_per_million: input,
+        cache_read_cost_per_million: input / 2.0,
+    }
+}
+
+/// Word-boundary check so model fragments like `o3` don't accidentally
+/// match `gpt-5.4-nano` or `provider-prefixed-o3-foo` from earlier
+/// branches. Treats `-`, `_`, `/`, `:` and start-of-string as word
+/// boundaries.
+fn has_word(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() || bytes.len() < nbytes.len() {
+        return false;
+    }
+    let is_boundary = |b: u8| matches!(b, b'-' | b'_' | b'/' | b':');
+    let mut i = 0;
+    while i + nbytes.len() <= bytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes {
+            let before_ok = i == 0 || is_boundary(bytes[i - 1]);
+            let after_idx = i + nbytes.len();
+            let after_ok = after_idx == bytes.len() || is_boundary(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 impl TokenUsage {
