@@ -563,6 +563,10 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
+        // v0.4.12 #238 — `strictMode: true` hard-locks sandbox policy
+        // so LLM tool calls can't bypass via `dangerouslyDisableSandbox`.
+        // See SandboxConfig::resolve_request docs.
+        strict_mode: optional_bool(sandbox, "strictMode", "merged settings.sandbox")?,
     })
 }
 

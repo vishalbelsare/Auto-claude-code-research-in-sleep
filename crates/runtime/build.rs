@@ -7,13 +7,12 @@ use walkdir::WalkDir;
 
 const MAX_FILE_SIZE: u64 = 512 * 1024;
 const ALLOWED_EXTS: &[&str] = &[
-    "md", "py", "sh", "tex", "cls", "bst", "toml", "yaml", "yml", "json",
+    "md", "py", "sh", "tex", "cls", "bst", "toml", "yaml", "yml", "json", "html",
 ];
-const EXCLUDED_SKILL_PREFIXES: &[&str] = &[
-    "skills-codex",
-    "skills-codex-claude-review",
-    "skills-codex-gemini-review",
-];
+/// Skill directory name prefixes to exclude from bundling. v0.4.12 changed
+/// from exact-match list to `starts_with` semantics so future variants like
+/// `skills-codex-foo/` are auto-excluded without code change.
+const EXCLUDED_SKILL_PREFIX: &str = "skills-codex";
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -71,8 +70,9 @@ fn main() {
 
             let name = entry.file_name().to_string_lossy().to_string();
 
-            // Exclude review-snapshot mirrors (not user-facing skills)
-            if EXCLUDED_SKILL_PREFIXES.contains(&name.as_str()) {
+            // Exclude review-snapshot mirrors (not user-facing skills).
+            // v0.4.12: starts_with covers future variants too.
+            if name.starts_with(EXCLUDED_SKILL_PREFIX) {
                 continue;
             }
 

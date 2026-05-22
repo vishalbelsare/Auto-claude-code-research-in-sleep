@@ -9,7 +9,9 @@ use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::sse::SseParser;
-use crate::types::{MessageRequest, MessageResponse, StreamEvent};
+use crate::types::{
+    ContentBlockDelta, MessageRequest, MessageResponse, OutputContentBlock, StreamEvent,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -239,6 +241,7 @@ impl AnthropicClient {
             parser: SseParser::new(),
             pending: VecDeque::new(),
             events_emitted: 0,
+            has_emitted_meaningful_content: false,
             stream_retries_remaining: read_stream_retry_budget(),
             observed_terminal: false,
             done: false,
@@ -663,18 +666,67 @@ pub struct MessageStream {
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
     /// Number of events the caller has already observed via
-    /// [`next_event`](Self::next_event). Zero ⇒ eligible for a
-    /// whole-stream restart on chunk failure or premature EOF.
+    /// [`next_event`](Self::next_event). Retained from v0.4.10 for
+    /// session-level stats / debugging — covers any yielded protocol
+    /// event including `MessageStart`, empty `text_delta`, etc.
     events_emitted: usize,
+    /// `true` once we've yielded at least one event the caller can
+    /// actually use (non-empty text/thinking delta, accumulating
+    /// tool_use input, or ContentBlockStop). v0.4.12 retry-eligibility
+    /// gate (codex P1.A): `MessageStart` alone or a stream that only
+    /// sent `MessageStart` then EOF can still be safely retried because
+    /// nothing observable was committed. Aligns with OpenAI executor's
+    /// `nothing_emitted_yet()` predicate.
+    has_emitted_meaningful_content: bool,
     /// Remaining whole-stream restart budget. Initialised from
     /// `ARIS_STREAM_RETRY` (default 2, clamped 0..=5).
     stream_retries_remaining: u8,
     /// `true` once we see Anthropic's `MessageStop` (the protocol's
-    /// terminal event). Combined with `events_emitted == 0` to
-    /// distinguish "proxy aborted before sending anything" from
-    /// "complete short response".
+    /// terminal event). Combined with
+    /// `has_emitted_meaningful_content == false` to distinguish
+    /// "proxy aborted before sending anything" from "complete short
+    /// response".
     observed_terminal: bool,
     done: bool,
+}
+
+/// v0.4.12 P1.A — classify whether yielding this event commits visible
+/// state to the caller (so a whole-stream restart afterwards would
+/// break output continuity). Aligns with OpenAI executor's
+/// `nothing_emitted_yet()` definition: non-empty text/thinking, any
+/// accumulating tool_use input, or a finished content block all count
+/// as meaningful.
+///
+/// `ContentBlockStart::ToolUse` is **also** meaningful (codex round-3
+/// finding #1): callers write `pending_tool` state when they see a
+/// `ToolUse` start, so if the stream then aborts and we transparently
+/// retry with a new request, the new stream might come back with text
+/// and we'd risk emitting a stale `pending_tool` at the next
+/// `ContentBlockStop`. Being conservative here closes that window —
+/// the price is a marginally larger pool of unretryable streams.
+///
+/// `MessageStart` / `MessageDelta` / `MessageStop` and `ContentBlockStart`
+/// with empty `Text` / `Thinking` content are still safe to discard
+/// and so are NOT meaningful.
+fn event_is_meaningful_content(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::ContentBlockDelta(e) => match &e.delta {
+            ContentBlockDelta::TextDelta { text } => !text.is_empty(),
+            ContentBlockDelta::ThinkingDelta { thinking } => !thinking.is_empty(),
+            ContentBlockDelta::InputJsonDelta { .. } => true,
+            ContentBlockDelta::SignatureDelta { .. } => false,
+        },
+        StreamEvent::ContentBlockStop(_) => true,
+        StreamEvent::ContentBlockStart(e) => match &e.content_block {
+            OutputContentBlock::Text { text } => !text.is_empty(),
+            OutputContentBlock::Thinking { thinking, .. } => !thinking.is_empty(),
+            // ToolUse start commits caller pending_tool state — see doc above.
+            OutputContentBlock::ToolUse { .. } => true,
+        },
+        // MessageStart / MessageDelta / MessageStop / Error — protocol-only,
+        // no caller-visible content commitment.
+        _ => false,
+    }
 }
 
 impl MessageStream {
@@ -706,9 +758,12 @@ impl MessageStream {
                         retryable: false,
                     });
                 }
-                // Track terminal signal + bump emitted counter.
+                // Track terminal signal + meaningful-content flag + counter.
                 if matches!(event, StreamEvent::MessageStop(_)) {
                     self.observed_terminal = true;
+                }
+                if event_is_meaningful_content(&event) {
+                    self.has_emitted_meaningful_content = true;
                 }
                 self.events_emitted = self.events_emitted.saturating_add(1);
                 return Ok(Some(event));
@@ -716,16 +771,19 @@ impl MessageStream {
 
             if self.done {
                 // Premature EOF retry path: if the server closed the
-                // stream cleanly (no reqwest error) but we never
-                // observed any event AND never saw MessageStop, the
-                // proxy probably aborted upstream. Try a whole-stream
-                // restart before surfacing the parser error or empty
-                // result. Capture finish() instead of `?`-propagating
-                // so a half-parsed JSON tail doesn't bypass the retry.
+                // stream cleanly (no reqwest error) but no meaningful
+                // content reached the caller AND we never saw
+                // MessageStop, the proxy probably aborted upstream.
+                // Try a whole-stream restart before surfacing the
+                // parser error or empty result. v0.4.12 P1.A (codex
+                // round-2 finding #3): gate retry on
+                // `!has_emitted_meaningful_content` not `events_emitted == 0`,
+                // so a stream that only sent `MessageStart` then died
+                // is still retry-eligible.
                 let finish_result = self.parser.finish();
                 let parser_errored = finish_result.is_err();
                 let leftover_empty = finish_result.as_ref().map(Vec::is_empty).unwrap_or(false);
-                if self.events_emitted == 0
+                if !self.has_emitted_meaningful_content
                     && !self.observed_terminal
                     && (parser_errored || leftover_empty)
                     && self.stream_retries_remaining > 0
@@ -744,6 +802,9 @@ impl MessageStream {
                     if matches!(event, StreamEvent::MessageStop(_)) {
                         self.observed_terminal = true;
                     }
+                    if event_is_meaningful_content(&event) {
+                        self.has_emitted_meaningful_content = true;
+                    }
                     self.events_emitted = self.events_emitted.saturating_add(1);
                     return Ok(Some(event));
                 }
@@ -759,9 +820,14 @@ impl MessageStream {
                 }
                 Err(error) => {
                     // Mid-body abort. Retry the whole request if we
-                    // haven't shown the caller anything yet — there's
-                    // no resume primitive in either upstream API.
-                    if self.events_emitted == 0
+                    // haven't surfaced any meaningful content to the
+                    // caller yet — there's no resume primitive in
+                    // either upstream API. v0.4.12 P1.A: gate on
+                    // `!has_emitted_meaningful_content` not raw
+                    // `events_emitted`, so a stream that only sent
+                    // `MessageStart` before aborting is still safe
+                    // to restart.
+                    if !self.has_emitted_meaningful_content
                         && self.stream_retries_remaining > 0
                         && stream_chunk_error_is_retryable(&error)
                     {
@@ -790,6 +856,12 @@ impl MessageStream {
         self.parser = SseParser::new();
         self.pending.clear();
         self.done = false;
+        // Defensive reset — restart only fires while these are already
+        // in their "nothing committed" state, but resetting explicitly
+        // keeps the invariant obvious to future readers.
+        self.events_emitted = 0;
+        self.has_emitted_meaningful_content = false;
+        self.observed_terminal = false;
         Ok(())
     }
 }

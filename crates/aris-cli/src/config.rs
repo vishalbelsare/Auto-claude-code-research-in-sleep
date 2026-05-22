@@ -548,7 +548,7 @@ pub fn run_interactive_setup() -> io::Result<ArisConfig> {
     println!("  4. MiniMax         (MiniMax-M2.7)");
     println!("  5. Kimi            (kimi-k2.5)");
     println!("  6. Anthropic Proxy (claude via proxy)");
-    println!("  7. DeepSeek        (deepseek-chat)");
+    println!("  7. DeepSeek        (deepseek-v4-pro)");
     println!("  8. Skip (no reviewer)");
     println!("  9. Custom          (OpenAI-compatible endpoint)");
     let default_reviewer = match config.reviewer_provider.as_deref() {

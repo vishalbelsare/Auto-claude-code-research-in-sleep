@@ -194,26 +194,58 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     // ── Other Chinese providers ─────────────────────────────────
     // No exposed cache-tier billing — generic_pricing (cache_read =
     // input/2, cache_creation = input).
-    if m.contains("glm") {
+    //
+    // v0.4.12 P2 (codex audit): switched from `contains()` to
+    // `provider_match()` which requires the family name to be either
+    // a model-name prefix (`kimi-k2.5`, `qwen3.6-plus`, `glm-4-plus`)
+    // OR appear as a provider segment (`openai/kimi-k2.5`). This
+    // protects user-named models like `my-kimi-clone` from being
+    // silently routed to the wrong tier while still catching real
+    // model identifiers — including those with digit suffixes
+    // (`qwen3.6`) that the boundary-based `has_word` would miss.
+    if provider_match(&m, "glm") {
         return Some(generic_pricing(0.5, 2.0));
     }
-    if m.contains("minimax") {
+    if provider_match(&m, "minimax") {
         return Some(generic_pricing(0.6, 2.4));
     }
-    if m.contains("kimi") || m.contains("moonshot") {
+    if provider_match(&m, "kimi") || provider_match(&m, "moonshot") {
         return Some(generic_pricing(0.6, 2.5));
     }
-    if m.contains("mimo") {
+    if provider_match(&m, "mimo") {
         return Some(generic_pricing(0.4, 1.6));
     }
-    if m.contains("qwen") {
+    if provider_match(&m, "qwen") {
         return Some(generic_pricing(0.4, 1.6));
     }
-    if m.contains("doubao") {
+    if provider_match(&m, "doubao") {
         return Some(generic_pricing(0.3, 1.2));
     }
 
     None
+}
+
+/// v0.4.12 P2 — provider family name match. Recognises the prefix at the
+/// start of a model name (`kimi-k2.5`, `qwen3.6-plus`) OR after a `/`
+/// provider segment separator (`openai/kimi-foo`, `provider:moonshot-v1`).
+/// Rejects mid-word matches (`my-kimi-clone`) which `contains()` would
+/// have caught. More permissive than `has_word` for cases where the
+/// suffix is a digit (Qwen versioning).
+fn provider_match(model: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    if model.starts_with(prefix) {
+        return true;
+    }
+    // provider-prefixed forms: "openai/kimi-...", "proxy:moonshot-..."
+    for sep in &['/', ':'] {
+        let needle = format!("{sep}{prefix}");
+        if model.contains(&needle) {
+            return true;
+        }
+    }
+    false
 }
 
 /// OpenAI pricing helper. cache_read = 10% of input — OpenAI's

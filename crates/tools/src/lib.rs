@@ -72,7 +72,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" }
+                    "dangerouslyDisableSandbox": {
+                        "type": "boolean",
+                        "description": "Request that this single command bypass the sandbox. Honored only when the runtime config has `sandbox.strictMode != true`. When `sandbox.strictMode: true` is set by the user, this field is ignored and the runtime emits a warning. Default false."
+                    }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -3628,16 +3631,46 @@ fn send_reviewer_request_with_retry(
 /// request field. Mirrors the allow-list in `aris-cli/openai_executor.rs`
 /// so reviewer and executor agree on which models route through which API
 /// shape.
+///
+/// v0.4.12 P1.B: uses [`reviewer_word_match`] so provider-prefixed names
+/// (`openai/o3-mini`, `proxy:o4`) are recognised — `starts_with` was the
+/// prior gate and missed those.
 #[must_use]
 fn reviewer_supports_reasoning_effort(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
+    reviewer_word_match(&m, "o1")
+        || reviewer_word_match(&m, "o3")
+        || reviewer_word_match(&m, "o4")
         || m.contains("gpt-5.5")
         || m.contains("gpt-5.6")
         || m.contains("reasoner")
         || m.contains("thinking")
+}
+
+/// v0.4.12 P1.B — word-boundary match (boundary = `-_/:` + start/end).
+/// Mirrors `runtime::usage::has_word` and `openai_executor::word_match`
+/// so reviewer capability detection stays consistent with executor +
+/// pricing table.
+fn reviewer_word_match(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() || bytes.len() < nbytes.len() {
+        return false;
+    }
+    let is_boundary = |b: u8| matches!(b, b'-' | b'_' | b'/' | b':');
+    let mut i = 0;
+    while i + nbytes.len() <= bytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes {
+            let before_ok = i == 0 || is_boundary(bytes[i - 1]);
+            let after_idx = i + nbytes.len();
+            let after_ok = after_idx == bytes.len() || is_boundary(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Effort tier for reasoning-capable reviewer calls. Reads

@@ -32,7 +32,17 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # v0.4.12 v0.4.11-followup: fetch-depth: 0 so the
+      # `skills_source_commit_pin_present_and_well_formed` drift test
+      # can do the optional ancestor check against `origin/main`.
+      # Default shallow checkout makes that check silently skip.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch origin/main for SKILLS_SOURCE_COMMIT ancestor check
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+        continue-on-error: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +72,15 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      # v0.4.12 v0.4.11-followup: fetch-depth: 0 mirrors the ubuntu job
+      # so the drift test ancestor check has full git history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch origin/main for SKILLS_SOURCE_COMMIT ancestor check
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+        continue-on-error: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

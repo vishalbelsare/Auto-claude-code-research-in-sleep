@@ -31,6 +31,13 @@ pub struct SandboxConfig {
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     pub allowed_mounts: Vec<String>,
+    /// v0.4.12 #238 — when `Some(true)`, [`resolve_request`] ignores all
+    /// LLM-supplied override arguments (`enabled`, `namespace`, `network`,
+    /// `filesystem_mode`, `allowed_mounts`) and uses the config value
+    /// only. Lets users hard-lock sandbox policy so a tool call with
+    /// `dangerouslyDisableSandbox: true` can't silently bypass.
+    /// Default `None` (permissive) preserves the pre-v0.4.12 behaviour.
+    pub strict_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -83,6 +90,23 @@ pub struct LinuxSandboxCommand {
 }
 
 impl SandboxConfig {
+    /// `true` if the runtime has been told to hard-lock sandbox policy
+    /// against LLM overrides. v0.4.12 #238.
+    #[must_use]
+    pub fn is_strict(&self) -> bool {
+        self.strict_mode.unwrap_or(false)
+    }
+
+    /// Resolve the effective per-call [`SandboxRequest`] from a set of
+    /// optional LLM-supplied overrides.
+    ///
+    /// **v0.4.12 #238**: when `self.is_strict()` returns `true`, **all**
+    /// override arguments are ignored — only the values configured by
+    /// the user (or defaults) are honoured. This closes the gap where
+    /// a tool call with `dangerouslyDisableSandbox: true` could silently
+    /// bypass a user's stricter config. The check is applied to every
+    /// override (enabled, namespace, network, filesystem, allowed_mounts)
+    /// uniformly so a LLM can't relax any axis under strict mode.
     #[must_use]
     pub fn resolve_request(
         &self,
@@ -92,15 +116,34 @@ impl SandboxConfig {
         filesystem_mode_override: Option<FilesystemIsolationMode>,
         allowed_mounts_override: Option<Vec<String>>,
     ) -> SandboxRequest {
+        let (
+            effective_enabled_override,
+            effective_namespace_override,
+            effective_network_override,
+            effective_filesystem_override,
+            effective_mounts_override,
+        ) = if self.is_strict() {
+            (None, None, None, None, None)
+        } else {
+            (
+                enabled_override,
+                namespace_override,
+                network_override,
+                filesystem_mode_override,
+                allowed_mounts_override,
+            )
+        };
         SandboxRequest {
-            enabled: enabled_override.unwrap_or(self.enabled.unwrap_or(true)),
-            namespace_restrictions: namespace_override
+            enabled: effective_enabled_override.unwrap_or(self.enabled.unwrap_or(true)),
+            namespace_restrictions: effective_namespace_override
                 .unwrap_or(self.namespace_restrictions.unwrap_or(true)),
-            network_isolation: network_override.unwrap_or(self.network_isolation.unwrap_or(false)),
-            filesystem_mode: filesystem_mode_override
+            network_isolation: effective_network_override
+                .unwrap_or(self.network_isolation.unwrap_or(false)),
+            filesystem_mode: effective_filesystem_override
                 .or(self.filesystem_mode)
                 .unwrap_or_default(),
-            allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
+            allowed_mounts: effective_mounts_override
+                .unwrap_or_else(|| self.allowed_mounts.clone()),
         }
     }
 }
@@ -322,6 +365,7 @@ mod tests {
             network_isolation: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: vec!["logs".to_string()],
+            strict_mode: None,
         };
 
         let request = config.resolve_request(

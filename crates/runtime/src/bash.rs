@@ -174,6 +174,18 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         |_| SandboxConfig::default(),
         |runtime_config| runtime_config.sandbox().clone(),
     );
+
+    // v0.4.12 #238 — when the user has set `sandbox.strictMode: true` in
+    // their config and the LLM tool call nonetheless requests
+    // `dangerouslyDisableSandbox: true` (or any other override that
+    // contradicts strict policy), emit a one-shot per-process warning
+    // so the user can see their config is being honoured. The actual
+    // request is resolved below by SandboxConfig::resolve_request which
+    // already drops all LLM overrides in strict mode.
+    if config.is_strict() && input_attempts_to_relax_sandbox(input) {
+        warn_strict_sandbox_override();
+    }
+
     let request = config.resolve_request(
         input.dangerously_disable_sandbox.map(|disabled| !disabled),
         input.namespace_restrictions,
@@ -182,6 +194,33 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         input.allowed_mounts.clone(),
     );
     resolve_sandbox_status_for_request(&request, cwd)
+}
+
+/// v0.4.12 #238 — `true` when the bash tool call carries any sandbox
+/// override the LLM might use to relax policy. Used to gate the
+/// strictMode warning so we only complain when there's an actual
+/// conflict to flag.
+fn input_attempts_to_relax_sandbox(input: &BashCommandInput) -> bool {
+    input.dangerously_disable_sandbox == Some(true)
+        || input.namespace_restrictions == Some(false)
+        || input.isolate_network == Some(false)
+        || input.filesystem_mode.is_some()
+        || input.allowed_mounts.is_some()
+}
+
+/// v0.4.12 #238 — one-shot per-process stderr warning when strict
+/// sandbox policy silently overrides a LLM tool-call override. Per-process
+/// not per-session so a long-running REPL doesn't spam the user.
+fn warn_strict_sandbox_override() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m sandbox.strictMode is enabled; \
+             LLM-requested sandbox override (e.g. `dangerouslyDisableSandbox: true`) \
+             is being ignored. Set `sandbox.strictMode: false` (or remove the field) \
+             in your config to allow LLM overrides."
+        );
+    });
 }
 
 fn prepare_command(

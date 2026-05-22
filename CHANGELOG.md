@@ -1,5 +1,136 @@
 # ARIS-Code Changelog
 
+## v0.4.12 (2026-05-22)
+
+A bug-fix + small-feature release polishing several rough edges that
+surfaced in v0.4.10's Codex audit + community-reported issues since
+v0.4.11 shipped. Headlining the sandbox-config priority fix (#238),
+plus the four streaming/pricing P1 follow-ups deferred from v0.4.10.
+
+### 🚨 P0 — user-reported bugs
+
+- **#238 `sandbox.strictMode` config option** — `SandboxConfig` gains
+  `strict_mode: Option<bool>` (parsed from `settings.json` as
+  `sandbox.strictMode`). When `true`, `resolve_request()` ignores **all**
+  LLM-supplied overrides — `dangerouslyDisableSandbox`,
+  `namespaceRestrictions`, `isolateNetwork`, `filesystemMode`,
+  `allowedMounts` — and uses only what the user configured. Closes the
+  gap where a LLM could silently bypass the user's strict sandbox by
+  passing `dangerouslyDisableSandbox: true`. Default is `false`
+  (opt-in) for backward compatibility; explicitly set `strictMode: true`
+  to hard-lock. The bash tool schema now documents this on the
+  `dangerouslyDisableSandbox` field, and `aris doctor` reports the
+  effective sandbox configuration. A one-shot per-process stderr
+  warning fires when a strict config silently overrides an LLM request.
+
+- **#232 `auto-review-loop-llm` DeepSeek deprecation** — Provider table
+  and config examples updated from `deepseek-chat` / `deepseek-reasoner`
+  to `deepseek-v4-flash` / `deepseek-v4-pro`. DeepSeek announced the
+  legacy aliases deprecate 2026-07-24, and R1-class reasoner models
+  reject `tool_choice` (which the auto-review loop requires). The
+  `aris setup` reviewer menu was also updated.
+
+### 🟡 P1 — v0.4.10 audit follow-ups (Codex GPT-5.5 xhigh)
+
+- **P1.A Anthropic stream retry coverage** — `MessageStream` gains
+  `has_emitted_meaningful_content: bool` next to the existing
+  `events_emitted` counter. The whole-stream retry now triggers when
+  no meaningful content has been emitted, not just when *no* event
+  has. This means a stream that only sent `MessageStart` before EOF
+  is now retry-eligible. Meaningful = non-empty text/thinking, any
+  `InputJsonDelta`, any `ContentBlockStop`, or any `ContentBlockStart`
+  for `ToolUse`/non-empty Text/non-empty Thinking. `ToolUse` start
+  is conservatively counted (per Codex round-3) because the caller
+  commits `pending_tool` state on receipt.
+
+- **P1.B o-series reasoning effort detection (provider-prefixed)** —
+  Both the executor (`openai_executor.rs::supports_reasoning_effort`)
+  and the reviewer mirror (`tools/lib.rs::reviewer_supports_reasoning_effort`)
+  now use word-boundary matching (boundary = `-_/:` + start/end).
+  `openai/o3-mini`, `proxy:o4` and similar provider-prefixed names
+  are now recognised. Previously `starts_with("o3")` missed them and
+  the request omitted `reasoning_effort`.
+
+- **P1.C `stream_options.include_usage` proxy fallback** — When the
+  OpenAI executor's request returns `400` with an error body that
+  fingers `stream_options` as an unknown/extra field (strict
+  matcher: JSON `error.param.starts_with("stream_options")` OR body
+  containing both `stream_options` and one of
+  `unknown`/`unrecognized`/`extra`/`additional`/`unsupported`/
+  `not allowed`/`invalid field`), the executor retries once without
+  the field. Sacrifices prefix-cache token reporting for
+  compatibility with compat-mode proxies. Real OpenAI, vLLM, SGLang,
+  OpenRouter all accept `stream_options` so this only fires on
+  noncompliant proxies.
+
+- **P2 pricing match precision** — `runtime/usage.rs` switched from
+  `contains()` to a new `provider_match()` helper for `kimi`,
+  `moonshot`, `mimo`, `qwen`, `glm`, `minimax`, `doubao`. The new
+  helper matches at the start of the model name or after a `/`/`:`
+  provider separator. This catches `qwen3.6-plus`, `kimi-k2.5`,
+  `glm-4-plus` etc. (which the boundary-based `has_word` would have
+  missed because digits aren't word boundaries), while rejecting
+  mid-word matches like `my-kimi-clone`.
+
+### 🔧 v0.4.11 follow-ups
+
+- **`build.rs` skills-codex glob** — `EXCLUDED_SKILL_PREFIXES` exact
+  match list collapsed to a single `EXCLUDED_SKILL_PREFIX = "skills-codex"`
+  with `starts_with()` semantics. Future `skills-codex-*` mirror
+  variants are now auto-excluded without code change.
+
+- **`build.rs` ALLOWED_EXTS gains `html`** — Required because the
+  newly bundled `/render-html` skill ships `.html` template files
+  under `skills/render-html/scripts/templates/`. Without this, the
+  templates didn't make it into the binary and `/render-html
+  --template academic` would fail at runtime.
+
+- **CI `fetch-depth: 0` + origin/main fetch** — Both `ubuntu` and
+  `macos` jobs in `.github/workflows/ci.yml` now do a full-depth
+  checkout and explicitly fetch `origin/main` so the
+  `skills_source_commit_pin_present_and_well_formed` drift test's
+  optional ancestor check actually runs in CI (was silently skipping
+  before due to shallow checkout).
+
+### 📦 Skills sync追新
+
+`SKILLS_SOURCE_COMMIT` advanced from v0.4.11's `ed638f3` to the
+current `main` HEAD. Inventory:
+
+- **Bundle skills**: 74 → 76 (+`/interview-cheatsheet`, +`/render-html`)
+- **Helper resources**: 49 → 52 (+`render_html.py`,
+  +`academic.html`, +`dashboard.html` under
+  `skills/render-html/scripts/`)
+- **Gemini MCP alias re-applied** — `gemini-search` and `research-lit`
+  v0.4.11's `auto-gemini-3` patch was reverted by sync (rsync
+  `--delete` overwriting hand-patched files). Re-applied; main-branch
+  PR pending.
+
+### 📐 Cross-model review
+
+Codex MCP (gpt-5.5 xhigh) reviewed four rounds:
+- round-1: plan v1 → GO-WITH-CAUTION + 8 findings → plan v2
+- round-2: plan v2 → GO-WITH-CAUTION + 3 implementation precision
+  findings → plan v3
+- round-3: final diff → NO-GO + 5 findings → all addressed
+  (`ContentBlockStart::ToolUse` conservative classification,
+  Cargo/CHANGELOG/README version bump, untracked new skills tracked,
+  doctor multi-field detection, setup UI DeepSeek alias fixed)
+- round-4: post-fix confirmation → GO
+
+Plan committed at `idea-stage/v0.4.12/plan.md` (round-1/2/3 review
+history recorded inline as `v2 修订` / `v3 修订` sections).
+
+### ⚠️ Known limitations deferred to v0.4.13
+
+- P1.D per-server MCP timeout (per-`ScopedMcpServerConfig` field)
+- JSON-RPC server notifications (`id == null` skip) in `mcp_stdio.rs`
+- `meta_opt/{log_event,check_ready}.sh` hook deploy via CLI init
+- #240 README章节层级 + 进一步精简
+- Comprehensive new-fix unit tests (current coverage: cache 9/9 +
+  sandbox 5/5 pass, but P1.A/B/C/P2/#238 changes don't yet have
+  targeted regression tests)
+
 ## v0.4.11 (2026-05-18)
 
 The skills bundle refresh / research workflow sync release. The binary

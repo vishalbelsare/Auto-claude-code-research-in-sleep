@@ -33,16 +33,89 @@ const MAX_REASONING_CACHE_TOTAL_CHARS: usize = 128_000;
 /// Whether this model accepts an OpenAI-style `reasoning_effort` request field.
 /// Heuristic-only: matches OpenAI reasoning families (o1/o3/o4, gpt-5.5+) and
 /// providers that advertise an explicit thinking/reasoner variant.
+///
+/// v0.4.12 P1.B: uses [`word_match`] so provider-prefixed model names like
+/// `openai/o3-mini` or `proxy:o4` are recognised — `starts_with("o3")` was
+/// the prior gate and missed those.
 #[must_use]
 fn supports_reasoning_effort(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
+    word_match(&m, "o1")
+        || word_match(&m, "o3")
+        || word_match(&m, "o4")
         || m.contains("gpt-5.5")
         || m.contains("gpt-5.6")
         || m.contains("reasoner")
         || m.contains("thinking")
+}
+
+/// v0.4.12 P1.C — detect a 400 response whose error body actually fingers
+/// `stream_options` as an unknown/extra/unsupported field. Used by the
+/// streaming chat completion call to decide whether to retry once without
+/// the `stream_options.include_usage` opt-in (compat-mode proxies that
+/// reject unknown body fields).
+///
+/// Strict match to avoid swallowing unrelated 400s:
+/// 1. Try JSON-parse the body and check `error.param` starts with
+///    `stream_options` (covers `stream_options.include_usage` deep path).
+/// 2. Otherwise fall back to substring scan requiring **both** the
+///    `stream_options` keyword and at least one rejection keyword
+///    (`unknown` / `unrecognized` / `extra` / `additional` / `unsupported`)
+///    in the same body.
+fn is_stream_options_unknown_field_error(body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(body) {
+        if let Some(param) = json
+            .get("error")
+            .and_then(|e| e.get("param"))
+            .and_then(|p| p.as_str())
+        {
+            if param.starts_with("stream_options") {
+                return true;
+            }
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("stream_options") {
+        return false;
+    }
+    const REJECT_KEYWORDS: &[&str] = &[
+        "unknown",
+        "unrecognized",
+        "extra",
+        "additional",
+        "unsupported",
+        "not allowed",
+        "invalid field",
+    ];
+    REJECT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// v0.4.12 P1.B — word-boundary match (treats `-`, `_`, `/`, `:` and start /
+/// end of string as boundaries). Mirrors `runtime::usage::has_word` so the
+/// executor's capability detection stays consistent with the pricing table.
+fn word_match(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() || bytes.len() < nbytes.len() {
+        return false;
+    }
+    let is_boundary = |b: u8| matches!(b, b'-' | b'_' | b'/' | b':');
+    let mut i = 0;
+    while i + nbytes.len() <= bytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes {
+            let before_ok = i == 0 || is_boundary(bytes[i - 1]);
+            let after_idx = i + nbytes.len();
+            let after_ok = after_idx == bytes.len() || is_boundary(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether this model EMITS `reasoning_content` blocks in the response that
@@ -313,8 +386,8 @@ impl ApiClient for OpenAIRuntimeClient {
             && on_openai
             && (model_lower.contains("gpt-5.5")
                 || model_lower.contains("gpt-5.6")
-                || model_lower.starts_with("o3")
-                || model_lower.starts_with("o4"));
+                || word_match(&model_lower, "o3")
+                || word_match(&model_lower, "o4"));
         let force_with_tools = std::env::var("ARIS_FORCE_REASONING_WITH_TOOLS")
             .ok()
             .as_deref()
@@ -345,6 +418,14 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
         self.runtime.block_on(async {
             const MAX_ATTEMPTS: u32 = 4;
             let mut attempt: u32 = 0;
+            // v0.4.12 P1.C — `stream_options.include_usage:true` is sent
+            // unconditionally for token-cost accuracy. Major providers
+            // (OpenAI, vLLM, SGLang, OpenRouter, Together) accept it,
+            // but some compatible-mode proxies reject unknown body
+            // fields with 400. When that happens, retry once without
+            // `stream_options` (sacrificing prefix-cache token reporting
+            // for compatibility). Only fires once per request.
+            let mut tried_without_stream_options = false;
             let mut response = loop {
                 attempt += 1;
                 if runtime::is_interrupted() {
@@ -395,9 +476,30 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                             }
                             continue;
                         }
-                        let body = resp.text().await.unwrap_or_else(|_| String::new());
+                        let body_text = resp.text().await.unwrap_or_else(|_| String::new());
+
+                        // v0.4.12 P1.C — proxy compatibility fallback
+                        // for `stream_options`. Only fires on a real 400
+                        // whose error body actually fingers
+                        // `stream_options` as an unknown / extra field.
+                        if status.as_u16() == 400
+                            && !tried_without_stream_options
+                            && is_stream_options_unknown_field_error(&body_text)
+                        {
+                            tried_without_stream_options = true;
+                            body.as_object_mut()
+                                .map(|m| m.remove("stream_options"));
+                            eprintln!(
+                                "\x1b[33m  OpenAI proxy rejected `stream_options.include_usage`, retrying without it (cached_tokens reporting will be skipped this turn)\x1b[0m"
+                            );
+                            // Don't bump attempt — this is a one-shot
+                            // body-shape adjustment, not a real retry.
+                            attempt = attempt.saturating_sub(1);
+                            continue;
+                        }
+
                         return Err(RuntimeError::new(format!(
-                            "OpenAI API error {status}: {body}"
+                            "OpenAI API error {status}: {body_text}"
                         )));
                     }
                     Err(e) => {

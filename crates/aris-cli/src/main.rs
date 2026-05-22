@@ -4869,7 +4869,37 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Check 4: Codex MCP in config
+    // Check 4 (v0.4.12 #238): Sandbox effective config
+    print!("  Sandbox:      ");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let sandbox_config = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|rc| rc.sandbox().clone())
+        .unwrap_or_default();
+    let strict = sandbox_config.is_strict();
+    let enabled = sandbox_config.enabled.unwrap_or(true);
+    // codex round-3 #4: detect any explicit sandbox field, not only `enabled`.
+    let has_any_explicit_sandbox_field = sandbox_config.enabled.is_some()
+        || sandbox_config.namespace_restrictions.is_some()
+        || sandbox_config.network_isolation.is_some()
+        || sandbox_config.filesystem_mode.is_some()
+        || !sandbox_config.allowed_mounts.is_empty()
+        || sandbox_config.strict_mode.is_some();
+    if strict {
+        println!(
+            "strict (config), enabled={enabled} — LLM override of `dangerouslyDisableSandbox` is IGNORED"
+        );
+    } else if has_any_explicit_sandbox_field {
+        println!(
+            "permissive (config), enabled={enabled} — LLM tool calls can override per-command via `dangerouslyDisableSandbox`"
+        );
+    } else {
+        println!(
+            "default-allow (no config) — set `sandbox.strictMode: true` in settings.json to hard-lock"
+        );
+    }
+
+    // Check 5: Codex MCP in config
     print!("  Codex MCP:    ");
     let home = runtime::home_dir();
     let config_path = PathBuf::from(&home).join(".claude.json");
