@@ -1,5 +1,101 @@
 # ARIS-Code Changelog
 
+## v0.4.13 (2026-05-25)
+
+A residue-cleanup release closing every codex-audit P1 left over from
+v0.4.10 through v0.4.12 plus the long-tail regression tests. No
+headlining new feature — the goal is to make the existing per-server
+MCP / hook / streaming code paths actually behave the way the docs
+already say they do.
+
+### 🟡 v0.4.10 audit P1.D — per-server MCP timeout
+
+`McpStdioServerConfig` gains `request_timeout_secs: Option<u64>`,
+parsed from `settings.json` as `mcpServers.<name>.requestTimeoutSecs`.
+Per-server override > `MCP_REQUEST_TIMEOUT_SECS` env > 300 s default,
+clamped 1..=1800 s. Useful when one Codex MCP agent legitimately
+needs 5 min while a filesystem MCP must error out in 5 s — the
+global env couldn't serve both.
+
+### 🟡 v0.4.10 known limitation — JSON-RPC notifications skip
+
+`McpStdioProcess::request()` now skips frames with absent / null
+`id` (JSON-RPC notification semantics, used by `notifications/log` /
+`notifications/progress`), prints
+`aris mcp: notification skipped: method=…` to stderr, and continues
+reading until the correlated response arrives. id-mismatch on a
+response frame is still fatal (kills the child).
+
+### 🟢 meta_opt hook deploy via `aris init`
+
+`tools/meta_opt/{log_event,check_ready}.sh` are now bundled. `aris
+init` deploys them to `~/.claude/hooks/` as
+**`aris-meta-opt-log-event.sh`** and **`aris-meta-opt-check-ready.sh`**
+(ARIS-namespaced — codex round-1 #1 caught that plain names would
+silently clobber user hooks). Entries are merged into
+`~/.claude/settings.json`'s `hooks.PostToolUse` /
+`PostToolUseFailure` / `UserPromptSubmit` / `SessionStart` /
+`SessionEnd` array (de-duped against existing — idempotent).
+Backups go to `settings.json.bak.<unix-millis>` with hard-fail
+semantics (codex round-1 #2: never silently destroy state). Final
+rewrite is atomic via tempfile + rename.
+
+### 🧪 v0.4.12 targeted regression coverage (9 new tests)
+
+Codex's v0.4.12 round-3 left a debt of "no targeted tests for the new
+fixes". Closed here:
+
+- `sandbox::tests`: `strict_mode_overrides_llm_disable`,
+  `strict_mode_ignores_all_five_llm_overrides`,
+  `default_non_strict_honors_llm_overrides`
+- `config::tests`: `parses_sandbox_strict_mode`
+- `usage::tests`: `provider_match_distinguishes_real_vs_userdefined`
+- `openai_executor::tests`: `word_match_handles_provider_prefixes`,
+  `is_stream_options_unknown_field_error_classification`
+- `client::tests`: `event_is_meaningful_content_classification` +
+  v0.4.13 `should_retry_on_premature_eof_truth_table` (codex round-1
+  #3 closed the "end-to-end retry trigger" gap by extracting the
+  5-condition retry guard into a pure fn so the truth table is
+  directly testable without mocking `reqwest::Response`)
+- `tools::tests`: `reviewer_word_match_provider_prefix`
+
+### 📦 Skills source-of-truth Gemini fix (`origin/main`)
+
+The `auto-gemini-3` MCP alias fix v0.4.11 and v0.4.12 had to re-apply
+to the bundle after every `sync_main_skills.sh` run is now in
+`origin/main` (`fedf361`): `skills/gemini-search/SKILL.md`
+DEFAULT_MODEL + literal in the Gemini-search MCP call,
+`skills/research-lit/SKILL.md` Gemini source MCP call. Next sync
+stays correct. `SKILLS_SOURCE_COMMIT` advanced from `d5f450c` to
+`fedf3612b696bd34f21d349d1859668983e6f4aa`.
+
+### 📦 Bundle
+
+`Embedded 76 bundled skills, 54 helper resources` (+2 from
+`meta_opt/{log_event,check_ready}.sh`).
+
+### 📐 Cross-model review
+
+Codex MCP (gpt-5.5 xhigh):
+- subagent dispatch + parallel implementation → 4 commits (plan +
+  3 subagent outputs c7afa95 / ffff3fa / b8cbcbd)
+- round-1 final diff: NO-GO + 3 findings (hook clobber, settings.json
+  non-atomic + best-effort backup, missing EOF-retry regression test)
+- round-2 (after `428b73f`): NO-GO + release-metadata-not-bumped —
+  fixed in this commit
+- round-3: post-bump confirmation pending
+
+### ⚠️ Known limitations deferred to v0.4.14
+
+- `tools/meta_opt/check_ready.sh` uses `awk '$0 > ts'` to filter
+  events since the last optimize, which compares whole JSONL lines
+  (start with `{`) against an ISO timestamp string and effectively
+  always matches. The bundled file is byte-exact from `origin/main`,
+  so the fix needs to go to main first then sync.
+- #240 README chapter numbering / further compression.
+- v0.5.0+ architectural work (provider abstraction, OpenAI Responses
+  API, complete MCP transport stack, sandbox hardening).
+
 ## v0.4.12 (2026-05-22)
 
 A bug-fix + small-feature release polishing several rough edges that
