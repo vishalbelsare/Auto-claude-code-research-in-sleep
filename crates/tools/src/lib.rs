@@ -5267,4 +5267,17 @@ printf 'pwsh:%s' "$1"
 
         std::env::remove_var("ARIS_REVIEWER_PROVIDER");
     }
+
+    // v0.4.13 regression — v0.4.12 P1.B introduced reviewer_word_match,
+    // a copy of runtime::usage::has_word so the reviewer crate stays
+    // consistent with the executor + pricing word-boundary detection.
+    // Lock down provider-prefix and digit-suffix boundary cases so a
+    // future divergence between the three copies surfaces here.
+    #[test]
+    fn reviewer_word_match_provider_prefix() {
+        assert!(super::reviewer_word_match("openai/o3-mini", "o3"));
+        assert!(super::reviewer_word_match("proxy:o4-preview", "o4"));
+        // Digit-suffix collision — "o32-mini" must NOT count as an o3 model.
+        assert!(!super::reviewer_word_match("o32-mini", "o3"));
+    }
 }

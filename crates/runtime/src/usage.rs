@@ -532,4 +532,60 @@ mod tests {
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
     }
+
+    // v0.4.13 regression — v0.4.12 P2 swapped the OSS provider lookup from
+    // `contains()` to `provider_match()`. That match requires the family
+    // name to appear at start-of-string OR after a `/`/`:` provider
+    // separator — never mid-word. This guards against three landmines at
+    // once:
+    //   (a) real model names (`kimi-k2.5`, `qwen3.6-plus`, `glm-4-plus`)
+    //       still resolve, including digit-suffix versions that
+    //       `has_word` would miss.
+    //   (b) provider-prefixed names (`openai/kimi-k2.5`) resolve via the
+    //       slash branch.
+    //   (c) user-named models with a family substring in the middle
+    //       (`my-kimi-clone`) do NOT silently route to the wrong tier —
+    //       they fall through to `None` so callers see the
+    //       `pricing=estimated-default` marker.
+    // Note: the start-of-string branch is intentionally permissive, so
+    // `kimiclone-foo` does match — documented behaviour we want to keep
+    // pinned so future tightening doesn't accidentally break the real
+    // `kimi-...` names.
+    #[test]
+    fn provider_match_distinguishes_real_vs_userdefined() {
+        // Real model names — must resolve to the family tier.
+        assert!(
+            pricing_for_model("qwen3.6-plus").is_some(),
+            "qwen3.6-plus is a real Qwen model and must price"
+        );
+        assert!(
+            pricing_for_model("kimi-k2.5").is_some(),
+            "kimi-k2.5 is a real Kimi model and must price"
+        );
+        assert!(
+            pricing_for_model("glm-4-plus").is_some(),
+            "glm-4-plus is a real GLM model and must price"
+        );
+
+        // Provider-prefixed forms must resolve via the `/` branch.
+        assert!(
+            pricing_for_model("openai/kimi-k2.5").is_some(),
+            "openai/kimi-k2.5 must resolve via provider-prefix branch"
+        );
+
+        // Mid-word matches must NOT route — falls through to None so
+        // callers see pricing=estimated-default rather than silently
+        // billing at the Kimi tier for a user model that happens to
+        // contain the substring.
+        assert!(
+            pricing_for_model("my-kimi-clone").is_none(),
+            "my-kimi-clone must NOT match Kimi family (mid-word rejection)"
+        );
+
+        // Start-of-string matches stay permissive (documented behaviour).
+        assert!(
+            pricing_for_model("kimiclone-foo").is_some(),
+            "kimiclone-foo starts with `kimi` so the provider_match prefix branch fires"
+        );
+    }
 }

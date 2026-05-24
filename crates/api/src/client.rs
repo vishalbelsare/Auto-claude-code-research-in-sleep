@@ -1295,4 +1295,109 @@ mod tests {
             Some("Bearer proxy-token")
         );
     }
+
+    // v0.4.13 regression — codex round-3 finding #1. The streaming retry
+    // path skips reconnects only when the events emitted so far are
+    // "meaningful content" — empty MessageStart/Stop frames are safe to
+    // discard. Pin the classification on every branch so a future refactor
+    // can't silently widen "non-meaningful" and break user-visible content
+    // commitments (text already streamed, tool_use call sites already
+    // committed).
+    #[test]
+    fn event_is_meaningful_content_classification() {
+        use crate::types::{
+            ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
+            MessageDelta, MessageDeltaEvent, MessageResponse, MessageStartEvent, MessageStopEvent,
+            OutputContentBlock, StreamEvent, Usage,
+        };
+
+        fn dummy_message_response() -> MessageResponse {
+            MessageResponse {
+                id: "msg_test".to_string(),
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                content: vec![],
+                model: "claude-test".to_string(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                },
+                request_id: None,
+            }
+        }
+
+        // Protocol-only frames: NOT meaningful (safe to discard on retry).
+        assert!(!super::event_is_meaningful_content(&StreamEvent::MessageStart(
+            MessageStartEvent {
+                message: dummy_message_response(),
+            }
+        )));
+        assert!(!super::event_is_meaningful_content(&StreamEvent::MessageDelta(
+            MessageDeltaEvent {
+                delta: MessageDelta {
+                    stop_reason: None,
+                    stop_sequence: None,
+                },
+                usage: Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                },
+            }
+        )));
+        assert!(!super::event_is_meaningful_content(&StreamEvent::MessageStop(
+            MessageStopEvent {}
+        )));
+
+        // Empty text_delta — caller hasn't seen any chars yet, safe to discard.
+        assert!(!super::event_is_meaningful_content(&StreamEvent::ContentBlockDelta(
+            ContentBlockDeltaEvent {
+                index: 0,
+                delta: ContentBlockDelta::TextDelta { text: String::new() },
+            }
+        )));
+
+        // Non-empty text_delta — committed user-visible content, MUST be meaningful.
+        assert!(super::event_is_meaningful_content(&StreamEvent::ContentBlockDelta(
+            ContentBlockDeltaEvent {
+                index: 0,
+                delta: ContentBlockDelta::TextDelta {
+                    text: "hello".to_string(),
+                },
+            }
+        )));
+
+        // ContentBlockStop — block-level commitment, must be meaningful.
+        assert!(super::event_is_meaningful_content(&StreamEvent::ContentBlockStop(
+            ContentBlockStopEvent { index: 0 }
+        )));
+
+        // ContentBlockStart::ToolUse — caller writes pending_tool state on
+        // the start frame; even with empty `input`, transparent retry now
+        // would risk stale tool_use commit on next BlockStop. Conservative
+        // per round-3 finding.
+        assert!(super::event_is_meaningful_content(&StreamEvent::ContentBlockStart(
+            ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::ToolUse {
+                    id: "x".to_string(),
+                    name: "y".to_string(),
+                    input: serde_json::json!({}),
+                },
+            }
+        )));
+
+        // ContentBlockStart::Text with empty text — no commitment yet.
+        assert!(!super::event_is_meaningful_content(&StreamEvent::ContentBlockStart(
+            ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Text { text: String::new() },
+            }
+        )));
+    }
 }

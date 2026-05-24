@@ -1105,4 +1105,59 @@ mod tests {
             .contains("compaction summary"));
         assert_eq!(result[1]["role"], "user");
     }
+
+    // v0.4.13 regression — v0.4.12 P1.B promoted the o-series detector
+    // from a bare `contains()` to a word-boundary check so that
+    // provider-prefixed (`openai/o3-mini`) and proxy-prefixed
+    // (`proxy:o4-preview`) names still resolve, but mid-word collisions
+    // (`foo-o3bar`, `o32-mini`) don't accidentally route. Pin every
+    // boundary case so a future tightening of the boundary set can't
+    // silently flip executor capability detection.
+    #[test]
+    fn word_match_handles_provider_prefixes() {
+        // Provider/proxy prefixed forms — `/` and `:` are valid boundaries.
+        assert!(word_match("openai/o3-mini", "o3"));
+        assert!(word_match("proxy:o4-preview", "o4"));
+        // `-` boundary at the start.
+        assert!(word_match("o1-mini", "o1"));
+        // Mid-word `o3` substring (no boundary before) — must NOT match.
+        assert!(!word_match("foo-o3bar", "o3"));
+        // Digit-suffix collision (`o32-mini` contains "o3" but the next
+        // byte is a digit, not a boundary char) — must NOT match.
+        assert!(!word_match("o32-mini", "o3"));
+        // Trailing boundary on the needle.
+        assert!(word_match("o3-", "o3"));
+        // Exact-equality (start-of-string + end-of-string boundaries).
+        assert!(word_match("o3", "o3"));
+    }
+
+    // v0.4.13 regression — v0.4.12 added the JSON-first stream_options
+    // rejection detector. The classifier has three branches and a fail-
+    // safe; pin all of them so a refactor can't silently relax detection.
+    #[test]
+    fn is_stream_options_unknown_field_error_classification() {
+        // JSON path: error.param == "stream_options" (exact match).
+        assert!(is_stream_options_unknown_field_error(
+            r#"{"error":{"message":"x","param":"stream_options","type":"invalid_request_error"}}"#
+        ));
+        // JSON path: error.param starts_with "stream_options" (deep field
+        // like `stream_options.include_usage`).
+        assert!(is_stream_options_unknown_field_error(
+            r#"{"error":{"param":"stream_options.include_usage","message":"x"}}"#
+        ));
+        // Text path: body contains "stream_options" + a reject keyword.
+        assert!(is_stream_options_unknown_field_error(
+            "{\"error\": \"unknown field stream_options\"}"
+        ));
+        // Negative: 400 about something else entirely.
+        assert!(!is_stream_options_unknown_field_error(
+            r#"{"error":{"message":"invalid api key","type":"auth_error"}}"#
+        ));
+        // Negative: contains "stream_options" but no reject keyword.
+        assert!(!is_stream_options_unknown_field_error(
+            r#"{"error":{"message":"stream_options ok"}}"#
+        ));
+        // Negative: empty body must not classify (fail-safe).
+        assert!(!is_stream_options_unknown_field_error(""));
+    }
 }
