@@ -3073,7 +3073,290 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 
 fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", init_claude_md()?);
+
+    // v0.4.13: deploy bundled meta_opt hooks to ~/.claude/hooks/ and merge
+    // their entries into ~/.claude/settings.json so /meta-optimize starts
+    // accumulating events from the next Claude Code run.
+    //
+    // extract_bundled_helpers() (run at startup, see main()) already wrote
+    // tools/meta_opt/{log_event,check_ready}.sh into
+    // ~/.config/aris/cache/<version>/. We copy from there to ~/.claude/hooks/
+    // (overwrite OK — bytes are versioned by aris release), then merge the
+    // hook config into ~/.claude/settings.json without clobbering existing
+    // user fields or hook entries.
+    match deploy_meta_opt_hooks() {
+        Ok(report) => {
+            if !report.is_empty() {
+                println!("{report}");
+            }
+        }
+        Err(e) => {
+            // Non-fatal: init succeeded for CLAUDE.md, hooks deploy is a
+            // nice-to-have. Surface as warning so users can investigate.
+            eprintln!(
+                "\x1b[33mwarning\x1b[0m: failed to deploy meta_opt hooks: {e}\n\
+                 \x1b[2m(CLAUDE.md was still initialized successfully.)\x1b[0m"
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Deploy bundled meta_opt hook scripts to `~/.claude/hooks/` and merge their
+/// hook config into `~/.claude/settings.json`.
+///
+/// Resolves HOME via `runtime::home_dir()` and the cache directory via
+/// `runtime::extraction_report()` (set by `runtime::extract_bundle()` at
+/// startup), then delegates to [`deploy_meta_opt_hooks_to`] for the actual
+/// file ops so tests can drive it with a tmp HOME.
+fn deploy_meta_opt_hooks() -> Result<String, Box<dyn std::error::Error>> {
+    let home = PathBuf::from(runtime::home_dir());
+    let cache_dir = runtime::extraction_report()
+        .and_then(|r| r.used_dir.clone())
+        .ok_or_else(|| {
+            "bundled helper cache unavailable; cannot deploy meta_opt hooks".to_string()
+        })?;
+    deploy_meta_opt_hooks_to(&home, &cache_dir)
+}
+
+/// v0.4.13 meta_opt hook scripts that get deployed from the cache to
+/// `~/.claude/hooks/`. Tuple order: (cache-relative path, destination basename).
+const META_OPT_HOOK_SCRIPTS: &[(&str, &str)] = &[
+    ("tools/meta_opt/log_event.sh", "log_event.sh"),
+    ("tools/meta_opt/check_ready.sh", "check_ready.sh"),
+];
+
+/// Pure-fn variant of [`deploy_meta_opt_hooks`] that takes explicit `home` +
+/// `cache_dir` paths so unit tests can isolate them from the real environment.
+///
+/// Behaviour:
+/// 1. Create `<home>/.claude/hooks/` if missing.
+/// 2. Copy `<cache_dir>/tools/meta_opt/{log_event,check_ready}.sh` to
+///    `<home>/.claude/hooks/`, chmod +x on Unix.
+/// 3. Read `<home>/.claude/settings.json` (or start with `{}`) and merge in
+///    PostToolUse / PostToolUseFailure / UserPromptSubmit / SessionStart /
+///    SessionEnd hook entries that reference the deployed scripts. Idempotent:
+///    a second run does not duplicate entries pointing at the same script.
+/// 4. Backup the existing settings.json to
+///    `<home>/.claude/settings.json.bak.<unix-millis>` before overwriting (only
+///    when there was a previous file).
+fn deploy_meta_opt_hooks_to(
+    home: &Path,
+    cache_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let claude_dir = home.join(".claude");
+    let hooks_dir = claude_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)
+        .map_err(|e| format!("create_dir_all({}): {e}", hooks_dir.display()))?;
+
+    // ---- Step 1: copy bundled scripts from cache → ~/.claude/hooks/ ----
+    let mut deployed: Vec<PathBuf> = Vec::new();
+    for (rel, dest_name) in META_OPT_HOOK_SCRIPTS {
+        let src = cache_dir.join(rel);
+        if !src.is_file() {
+            return Err(format!(
+                "bundled hook script missing from cache: {} (cache_dir={})",
+                rel,
+                cache_dir.display()
+            )
+            .into());
+        }
+        let dest = hooks_dir.join(dest_name);
+        fs::copy(&src, &dest)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dest)
+                .map_err(|e| format!("stat {}: {e}", dest.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dest, perms)
+                .map_err(|e| format!("chmod 0755 {}: {e}", dest.display()))?;
+        }
+        deployed.push(dest);
+    }
+
+    // ---- Step 2: merge entries into ~/.claude/settings.json ----
+    let settings_path = claude_dir.join("settings.json");
+    let (mut settings, had_existing) = match fs::read_to_string(&settings_path) {
+        Ok(text) => {
+            // Empty file → start with {} (avoid serde error on empty input).
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                (serde_json::json!({}), true)
+            } else {
+                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                    format!(
+                        "parse {}: {e} (refusing to clobber malformed user settings)",
+                        settings_path.display()
+                    )
+                })?;
+                if !parsed.is_object() {
+                    return Err(format!(
+                        "{} is not a JSON object (top-level must be {{...}})",
+                        settings_path.display()
+                    )
+                    .into());
+                }
+                (parsed, true)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (serde_json::json!({}), false),
+        Err(e) => return Err(format!("read {}: {e}", settings_path.display()).into()),
+    };
+
+    let log_event_path = hooks_dir.join("log_event.sh");
+    let check_ready_path = hooks_dir.join("check_ready.sh");
+
+    // Hook entry layout follows main's templates/claude-hooks/meta_logging.json
+    // verbatim, but with the bundled hook script paths (not $CLAUDE_PROJECT_DIR
+    // references). One hook entry per event name; "matcher": "" matches all
+    // tool calls / events for PostToolUse* variants. SessionEnd carries two
+    // sub-hooks: log_event AND check_ready.
+    let events_for_log_event = [
+        "PostToolUse",
+        "PostToolUseFailure",
+        "UserPromptSubmit",
+        "SessionStart",
+        "SessionEnd",
+    ];
+
+    let mut added_log_event = 0usize;
+    let mut added_check_ready = 0usize;
+
+    for event in events_for_log_event {
+        if ensure_hook_entry(
+            &mut settings,
+            event,
+            &log_event_path,
+            /*async_run=*/ true,
+        )? {
+            added_log_event += 1;
+        }
+    }
+    if ensure_hook_entry(
+        &mut settings,
+        "SessionEnd",
+        &check_ready_path,
+        /*async_run=*/ false,
+    )? {
+        added_check_ready += 1;
+    }
+
+    // ---- Step 3: backup existing file, then atomically rewrite ----
+    if had_existing {
+        let backup_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let backup_path = claude_dir.join(format!("settings.json.bak.{backup_suffix}"));
+        // Best-effort backup: don't fail the deploy if cp fails (e.g. permission
+        // hardened test env). The merge logic above is idempotent, so user can
+        // safely re-run.
+        let _ = fs::copy(&settings_path, &backup_path);
+    }
+
+    let pretty = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("serialize settings.json: {e}"))?;
+    fs::write(&settings_path, format!("{pretty}\n"))
+        .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
+
+    // ---- Step 4: human-readable report ----
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Meta-Optimize hooks deployed to {}",
+        hooks_dir.display()
+    ));
+    for p in &deployed {
+        if let Some(name) = p.file_name() {
+            lines.push(format!("  installed       {}", name.to_string_lossy()));
+        }
+    }
+    lines.push(format!(
+        "Merged into     {} (log_event added: {added_log_event}, check_ready added: {added_check_ready})",
+        settings_path.display()
+    ));
+    Ok(lines.join("\n"))
+}
+
+/// Look up `hooks.<event>` in `settings`, ensure there is a matcher entry whose
+/// sub-hooks include `command = "bash <script_path>"`. If an entry referencing
+/// the same script already exists (anywhere under `hooks.<event>[*].hooks[*]`),
+/// returns `false` (no-op). Otherwise inserts a new matcher entry and returns
+/// `true`.
+fn ensure_hook_entry(
+    settings: &mut serde_json::Value,
+    event: &str,
+    script_path: &Path,
+    async_run: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use serde_json::{json, Value};
+
+    let script_str = script_path.to_string_lossy().to_string();
+    let command = format!("bash {script_str}");
+
+    let obj = settings
+        .as_object_mut()
+        .ok_or_else(|| "settings is not a JSON object".to_string())?;
+    let hooks_entry = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let hooks_obj = hooks_entry
+        .as_object_mut()
+        .ok_or_else(|| "settings.hooks is not a JSON object".to_string())?;
+    let event_entry = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let event_arr = event_entry
+        .as_array_mut()
+        .ok_or_else(|| format!("settings.hooks.{event} is not a JSON array"))?;
+
+    // Idempotency check: scan all existing matcher entries for a sub-hook with
+    // the exact same command. If found, do nothing.
+    for matcher_entry in event_arr.iter() {
+        let Some(matcher_obj) = matcher_entry.as_object() else {
+            continue;
+        };
+        let Some(inner_hooks) = matcher_obj.get("hooks").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for hook in inner_hooks {
+            if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
+                if cmd == command {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    let new_entry = if async_run {
+        json!({
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 5,
+                    "async": true,
+                }
+            ],
+        })
+    } else {
+        json!({
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 5,
+                }
+            ],
+        })
+    };
+    event_arr.push(new_entry);
+    Ok(true)
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -5057,13 +5340,14 @@ fn discover_all_skills() -> Vec<(String, String, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
-        push_output_block, render_config_report, render_memory_report, render_repl_help,
-        resolve_model_alias, response_to_events, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        deploy_meta_opt_hooks_to, filter_tool_specs, format_compact_report, format_cost_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_resume_report, format_status_report,
+        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
+        parse_git_status_metadata, print_help_to, push_output_block, render_config_report,
+        render_memory_report, render_repl_help, resolve_model_alias, response_to_events,
+        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
@@ -5726,5 +6010,239 @@ mod tests {
             AssistantEvent::ToolUse { name, input, .. }
                 if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
         ));
+    }
+
+    // ----- v0.4.13: deploy_meta_opt_hooks_to tests -----
+    //
+    // These tests build a fake cache_dir + a fake HOME under env::temp_dir(),
+    // never touch the real ~/.claude, and exercise:
+    //   1. fresh deploy (no settings.json): hooks copied + settings created
+    //   2. existing settings preserved without clobber when we merge
+    //   3. idempotency: a second run does not duplicate hook entries
+
+    fn meta_opt_test_root() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("aris-meta-opt-test-{pid}-{nanos}"))
+    }
+
+    fn write_fake_cache(root: &std::path::Path) -> std::path::PathBuf {
+        let cache_dir = root.join("cache");
+        let meta_opt = cache_dir.join("tools").join("meta_opt");
+        std::fs::create_dir_all(&meta_opt).expect("create cache meta_opt dir");
+        std::fs::write(
+            meta_opt.join("log_event.sh"),
+            "#!/usr/bin/env bash\necho log_event\n",
+        )
+        .expect("write log_event.sh");
+        std::fs::write(
+            meta_opt.join("check_ready.sh"),
+            "#!/usr/bin/env bash\necho check_ready\n",
+        )
+        .expect("write check_ready.sh");
+        cache_dir
+    }
+
+    #[test]
+    fn deploy_meta_opt_hooks_creates_hooks_dir_and_copies_scripts() {
+        let root = meta_opt_test_root();
+        let cache_dir = write_fake_cache(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        let report = deploy_meta_opt_hooks_to(&home, &cache_dir)
+            .expect("first deploy should succeed");
+        assert!(
+            report.contains("Meta-Optimize hooks deployed"),
+            "report missing header: {report}"
+        );
+
+        let hooks_dir = home.join(".claude").join("hooks");
+        assert!(hooks_dir.is_dir(), "hooks dir should exist");
+        let log_event = hooks_dir.join("log_event.sh");
+        let check_ready = hooks_dir.join("check_ready.sh");
+        assert!(log_event.is_file(), "log_event.sh should exist");
+        assert!(check_ready.is_file(), "check_ready.sh should exist");
+
+        let log_event_body =
+            std::fs::read_to_string(&log_event).expect("read log_event.sh");
+        assert!(log_event_body.contains("echo log_event"));
+        let check_ready_body =
+            std::fs::read_to_string(&check_ready).expect("read check_ready.sh");
+        assert!(check_ready_body.contains("echo check_ready"));
+
+        // settings.json was created with the new hooks block
+        let settings_path = home.join(".claude").join("settings.json");
+        assert!(settings_path.is_file(), "settings.json should exist");
+        let settings_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+        // PostToolUse references log_event.sh
+        let post_arr = settings_value
+            .pointer("/hooks/PostToolUse")
+            .and_then(|v| v.as_array())
+            .expect("hooks.PostToolUse array");
+        assert_eq!(post_arr.len(), 1);
+        let post_cmd = post_arr[0]
+            .pointer("/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("PostToolUse command");
+        assert!(
+            post_cmd.contains("log_event.sh"),
+            "PostToolUse cmd should mention log_event.sh, got {post_cmd}"
+        );
+        // SessionEnd has BOTH log_event and check_ready
+        let session_end_arr = settings_value
+            .pointer("/hooks/SessionEnd")
+            .and_then(|v| v.as_array())
+            .expect("hooks.SessionEnd array");
+        assert_eq!(
+            session_end_arr.len(),
+            2,
+            "SessionEnd should have 2 matcher entries (log_event + check_ready)"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn deploy_meta_opt_hooks_merges_into_existing_settings_json_without_clobber() {
+        let root = meta_opt_test_root();
+        let cache_dir = write_fake_cache(&root);
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
+
+        // Pre-existing settings.json with user fields aris must NOT clobber.
+        let prior = serde_json::json!({
+            "model": "gpt-5.5",
+            "env": {"FOO": "bar"},
+            "permissions": {"defaultMode": "dontAsk"},
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "echo user-hook"}
+                        ]
+                    }
+                ]
+            }
+        });
+        let settings_path = claude_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&prior).unwrap(),
+        )
+        .expect("write prior settings.json");
+
+        deploy_meta_opt_hooks_to(&home, &cache_dir).expect("deploy should succeed");
+
+        let merged: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+
+        // User fields survived
+        assert_eq!(
+            merged.pointer("/model").and_then(|v| v.as_str()),
+            Some("gpt-5.5"),
+            "model field must be preserved"
+        );
+        assert_eq!(
+            merged.pointer("/env/FOO").and_then(|v| v.as_str()),
+            Some("bar"),
+            "env.FOO must be preserved"
+        );
+        assert_eq!(
+            merged
+                .pointer("/permissions/defaultMode")
+                .and_then(|v| v.as_str()),
+            Some("dontAsk"),
+            "permissions.defaultMode must be preserved"
+        );
+
+        // Existing PreToolUse user hook survived intact
+        let pre_arr = merged
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .expect("hooks.PreToolUse array");
+        assert_eq!(pre_arr.len(), 1, "user PreToolUse not duplicated");
+        let pre_cmd = pre_arr[0]
+            .pointer("/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("PreToolUse command");
+        assert_eq!(pre_cmd, "echo user-hook");
+
+        // New PostToolUse / SessionEnd hooks were added
+        assert!(merged.pointer("/hooks/PostToolUse").is_some());
+        assert!(merged.pointer("/hooks/SessionEnd").is_some());
+
+        // Backup file exists alongside (best-effort, but should be present here)
+        let mut backup_count = 0usize;
+        for entry in std::fs::read_dir(&claude_dir).expect("read claude dir") {
+            let e = entry.expect("dir entry");
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("settings.json.bak.") {
+                backup_count += 1;
+            }
+        }
+        assert!(backup_count >= 1, "expected a settings.json.bak.* backup");
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn deploy_meta_opt_hooks_idempotent_doesnt_dupe_on_second_run() {
+        let root = meta_opt_test_root();
+        let cache_dir = write_fake_cache(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        deploy_meta_opt_hooks_to(&home, &cache_dir).expect("first deploy");
+        deploy_meta_opt_hooks_to(&home, &cache_dir).expect("second deploy idempotent");
+
+        let settings_path = home.join(".claude").join("settings.json");
+        let merged: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+
+        // Each event should still have exactly one log_event matcher entry.
+        for event in [
+            "PostToolUse",
+            "PostToolUseFailure",
+            "UserPromptSubmit",
+            "SessionStart",
+        ] {
+            let arr = merged
+                .pointer(&format!("/hooks/{event}"))
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("hooks.{event} array missing"));
+            assert_eq!(
+                arr.len(),
+                1,
+                "{event} should have exactly 1 matcher entry after 2 deploys, got {}",
+                arr.len()
+            );
+        }
+
+        // SessionEnd has 2 entries (log_event + check_ready); they must NOT
+        // grow on the second deploy.
+        let session_end = merged
+            .pointer("/hooks/SessionEnd")
+            .and_then(|v| v.as_array())
+            .expect("hooks.SessionEnd array");
+        assert_eq!(
+            session_end.len(),
+            2,
+            "SessionEnd should have exactly 2 matcher entries after 2 deploys"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

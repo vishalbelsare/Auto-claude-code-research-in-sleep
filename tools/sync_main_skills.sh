@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# tools/sync_main_skills.sh — v0.4.11
+# tools/sync_main_skills.sh — v0.4.13
 #
 # Syncs the skills/ + tools/ subset from origin/main into
 # crates/runtime/assets/ so the binary bundle stays aligned with the
 # skills source-of-truth on main.
 #
-# Per idea-stage/v0.4.11/sync_plan.md:
+# Per idea-stage/v0.4.11/sync_plan.md and idea-stage/v0.4.13/plan.md:
 # - Excludes skills-codex* mirror directories (codex agent install path,
 #   not user-facing). build.rs already excludes them via
 #   EXCLUDED_SKILL_PREFIXES; rsync exclude is double-defense.
-# - Bundles 18 runtime helpers from tools/ (9 baseline refresh + 9 new).
-#   `meta_opt/*` (SessionEnd hooks) and `install_aris*` / `smart_update*`
+# - Bundles 20 runtime helpers from tools/ (9 baseline refresh + 9 v0.4.11
+#   additions + 2 v0.4.13 meta_opt hooks). `install_aris*` / `smart_update*`
 #   / `lint_skills_helpers.sh` etc. stay out of the binary.
+# - v0.4.13 adds `meta_opt/{log_event,check_ready}.sh` so `aris init` can
+#   deploy them as Claude Code hooks under `~/.claude/hooks/`.
 # - Aborts on any symlink under main's skills/ or tools/ (build.rs panics).
 #
 # Usage:
@@ -47,10 +49,13 @@ trap cleanup EXIT
 # ---------------------------------------------------------------
 echo "==> Pre-flight checks"
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "ERROR: working tree has uncommitted changes." >&2
-    echo "Commit, stash, or revert first — sync will rewrite crates/runtime/assets/." >&2
-    exit 1
+if [[ "${ARIS_SYNC_ALLOW_DIRTY:-0}" != "1" ]]; then
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "ERROR: working tree has uncommitted changes." >&2
+        echo "Commit, stash, or revert first — sync will rewrite crates/runtime/assets/." >&2
+        echo "(Set ARIS_SYNC_ALLOW_DIRTY=1 to bypass — used only for in-PR sync runs)" >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------
@@ -125,9 +130,9 @@ for d in "${SKILLS_CODEX_DIRS[@]}"; do
 done
 
 # ---------------------------------------------------------------
-# Step 6: Tools selective rsync (FULL 18 runtime helpers — codex round-3 #1)
+# Step 6: Tools selective rsync (FULL 20 runtime helpers — codex round-3 #1, v0.4.13 +2)
 # ---------------------------------------------------------------
-echo "==> Syncing 18 runtime helpers from tools/"
+echo "==> Syncing 20 runtime helpers from tools/"
 
 # Codex round-3 #1 caught that the v0.4.8/0.4.9 helpers also drift on
 # main (e.g. research_wiki.py went 315 -> 767 lines with the canonical
@@ -138,10 +143,10 @@ echo "==> Syncing 18 runtime helpers from tools/"
 # So the whitelist below covers the full runtime helper set:
 #   - 9 baseline helpers (v0.4.8/0.4.9 era) — refresh from main
 #   - 9 v0.4.11 additions — first time bundling
+#   - 2 v0.4.13 meta_opt hooks — bundled so `aris init` can deploy them
+#     to ~/.claude/hooks/ (see deploy_meta_opt_hooks in aris-cli main.rs).
 #
 # Explicitly NOT bundled (stay in main tools/ only):
-#   - meta_opt/{log_event,check_ready}.sh — SessionEnd hooks
-#     (deferred to v0.4.12 + a proper CLI init-time hook deploy)
 #   - experiment_queue/README.md — doc, not runtime
 #   - install_aris*.{sh,ps1}, smart_update*.{sh,ps1} — installer
 #   - lint_skills_helpers.sh — CI/dev tool
@@ -168,6 +173,9 @@ RUNTIME_HELPERS=(
     watchdog.py
     experiment_queue/build_manifest.py
     experiment_queue/queue_manager.py
+    # === v0.4.13 additions: Claude Code hooks for meta-optimize ===
+    meta_opt/log_event.sh
+    meta_opt/check_ready.sh
 )
 
 for helper in "${RUNTIME_HELPERS[@]}"; do
@@ -182,7 +190,7 @@ for helper in "${RUNTIME_HELPERS[@]}"; do
     rsync -av "$src" "$target"
 done
 
-# NOTE: this script does NOT auto-prune assets/tools/ — the 18 helpers
+# NOTE: this script does NOT auto-prune assets/tools/ — the 20 helpers
 # above are the complete intended bundle. If a stale helper survives that
 # nothing references, the bundle inventory test catches it on next
 # `cargo test`.
@@ -201,7 +209,7 @@ echo "==> Sync complete."
 echo
 echo "Next steps (run manually, in order):"
 echo "  1. cargo build --release"
-echo "     # confirm warning: Embedded ~74 bundled skills, ~49 helper resources"
+echo "     # confirm warning: Embedded ~76 bundled skills, ~54 helper resources"
 echo
 echo "  2. cargo test -p runtime --lib cache -- --test-threads=1"
 echo "     # 9 cache tests should pass (6 existing + 3 v0.4.11 drift tests)"
