@@ -3122,9 +3122,15 @@ fn deploy_meta_opt_hooks() -> Result<String, Box<dyn std::error::Error>> {
 
 /// v0.4.13 meta_opt hook scripts that get deployed from the cache to
 /// `~/.claude/hooks/`. Tuple order: (cache-relative path, destination basename).
+///
+/// **Codex round-1 finding #1**: destination names are ARIS-namespaced
+/// (`aris-meta-opt-*.sh`) so `aris init` never silently clobbers a user's
+/// own `log_event.sh` / `check_ready.sh` in `~/.claude/hooks/`. ARIS-owned
+/// files are visibly ours, impossible to collide with a hand-rolled hook,
+/// and safe to overwrite on every `aris init` since only we put them there.
 const META_OPT_HOOK_SCRIPTS: &[(&str, &str)] = &[
-    ("tools/meta_opt/log_event.sh", "log_event.sh"),
-    ("tools/meta_opt/check_ready.sh", "check_ready.sh"),
+    ("tools/meta_opt/log_event.sh", "aris-meta-opt-log-event.sh"),
+    ("tools/meta_opt/check_ready.sh", "aris-meta-opt-check-ready.sh"),
 ];
 
 /// Pure-fn variant of [`deploy_meta_opt_hooks`] that takes explicit `home` +
@@ -3207,8 +3213,11 @@ fn deploy_meta_opt_hooks_to(
         Err(e) => return Err(format!("read {}: {e}", settings_path.display()).into()),
     };
 
-    let log_event_path = hooks_dir.join("log_event.sh");
-    let check_ready_path = hooks_dir.join("check_ready.sh");
+    // v0.4.13 codex round-1 #1: paths must match the ARIS-namespaced
+    // destinations declared in META_OPT_HOOK_SCRIPTS so settings.json
+    // hook command strings actually point at the deployed scripts.
+    let log_event_path = hooks_dir.join("aris-meta-opt-log-event.sh");
+    let check_ready_path = hooks_dir.join("aris-meta-opt-check-ready.sh");
 
     // Hook entry layout follows main's templates/claude-hooks/meta_logging.json
     // verbatim, but with the bundled hook script paths (not $CLAUDE_PROJECT_DIR
@@ -3245,23 +3254,51 @@ fn deploy_meta_opt_hooks_to(
         added_check_ready += 1;
     }
 
-    // ---- Step 3: backup existing file, then atomically rewrite ----
+    // ---- Step 3: backup existing file (hard-fail if backup fails), then
+    // atomically rewrite via tempfile + rename (codex round-1 #2). ----
     if had_existing {
         let backup_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let backup_path = claude_dir.join(format!("settings.json.bak.{backup_suffix}"));
-        // Best-effort backup: don't fail the deploy if cp fails (e.g. permission
-        // hardened test env). The merge logic above is idempotent, so user can
-        // safely re-run.
-        let _ = fs::copy(&settings_path, &backup_path);
+        // Hard-fail on backup error so user never loses their settings.
+        // If the FS is read-only or we can't write, abort rather than
+        // silently destroying state.
+        fs::copy(&settings_path, &backup_path).map_err(|e| {
+            format!(
+                "backup {} → {} failed: {e}; aborting to protect existing settings",
+                settings_path.display(),
+                backup_path.display()
+            )
+        })?;
     }
 
     let pretty = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("serialize settings.json: {e}"))?;
-    fs::write(&settings_path, format!("{pretty}\n"))
-        .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
+    let body = format!("{pretty}\n");
+
+    // Atomic rewrite: write to a tempfile in the same directory, then
+    // rename. This is the only way to guarantee that a crash or signal
+    // can't leave settings.json half-written.
+    let temp_path = claude_dir.join(format!(
+        "settings.json.tmp.{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&temp_path, body)
+        .map_err(|e| format!("write tempfile {}: {e}", temp_path.display()))?;
+    fs::rename(&temp_path, &settings_path).map_err(|e| {
+        // Best-effort cleanup; the user can manually rm the .tmp.* file
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "atomic rename {} → {}: {e}",
+            temp_path.display(),
+            settings_path.display()
+        )
+    })?;
 
     // ---- Step 4: human-readable report ----
     let mut lines = Vec::new();
@@ -6062,16 +6099,17 @@ mod tests {
 
         let hooks_dir = home.join(".claude").join("hooks");
         assert!(hooks_dir.is_dir(), "hooks dir should exist");
-        let log_event = hooks_dir.join("log_event.sh");
-        let check_ready = hooks_dir.join("check_ready.sh");
-        assert!(log_event.is_file(), "log_event.sh should exist");
-        assert!(check_ready.is_file(), "check_ready.sh should exist");
+        // v0.4.13 codex round-1 #1: ARIS-namespaced destination names
+        let log_event = hooks_dir.join("aris-meta-opt-log-event.sh");
+        let check_ready = hooks_dir.join("aris-meta-opt-check-ready.sh");
+        assert!(log_event.is_file(), "aris-meta-opt-log-event.sh should exist");
+        assert!(check_ready.is_file(), "aris-meta-opt-check-ready.sh should exist");
 
         let log_event_body =
-            std::fs::read_to_string(&log_event).expect("read log_event.sh");
+            std::fs::read_to_string(&log_event).expect("read aris-meta-opt-log-event.sh");
         assert!(log_event_body.contains("echo log_event"));
         let check_ready_body =
-            std::fs::read_to_string(&check_ready).expect("read check_ready.sh");
+            std::fs::read_to_string(&check_ready).expect("read aris-meta-opt-check-ready.sh");
         assert!(check_ready_body.contains("echo check_ready"));
 
         // settings.json was created with the new hooks block
@@ -6081,7 +6119,7 @@ mod tests {
             &std::fs::read_to_string(&settings_path).expect("read settings.json"),
         )
         .expect("settings.json parses");
-        // PostToolUse references log_event.sh
+        // PostToolUse references aris-meta-opt-log-event.sh
         let post_arr = settings_value
             .pointer("/hooks/PostToolUse")
             .and_then(|v| v.as_array())
@@ -6092,8 +6130,8 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("PostToolUse command");
         assert!(
-            post_cmd.contains("log_event.sh"),
-            "PostToolUse cmd should mention log_event.sh, got {post_cmd}"
+            post_cmd.contains("aris-meta-opt-log-event.sh"),
+            "PostToolUse cmd should mention aris-meta-opt-log-event.sh, got {post_cmd}"
         );
         // SessionEnd has BOTH log_event and check_ready
         let session_end_arr = settings_value

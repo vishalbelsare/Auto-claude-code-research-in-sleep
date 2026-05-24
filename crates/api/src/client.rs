@@ -729,6 +729,31 @@ fn event_is_meaningful_content(event: &StreamEvent) -> bool {
     }
 }
 
+/// v0.4.13 codex round-1 #3 — extracted retry-trigger truth table so it
+/// can be unit-tested in isolation without mocking a `reqwest::Response`.
+///
+/// Returns `true` exactly when the premature-EOF retry path in
+/// `MessageStream::next_event` should fire:
+/// - no meaningful content yet (`MessageStart`-only stream is OK to discard)
+/// - never saw `MessageStop` (would be a complete short response, not abort)
+/// - parser surfaced an error OR finished with zero leftover events
+/// - retry budget remains
+///
+/// Together these guarantee a retry is safe (no user-visible state to
+/// preserve) and useful (something actually went wrong).
+fn should_retry_on_premature_eof(
+    has_emitted_meaningful_content: bool,
+    observed_terminal: bool,
+    parser_errored: bool,
+    leftover_empty: bool,
+    stream_retries_remaining: u8,
+) -> bool {
+    !has_emitted_meaningful_content
+        && !observed_terminal
+        && (parser_errored || leftover_empty)
+        && stream_retries_remaining > 0
+}
+
 impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
@@ -783,11 +808,13 @@ impl MessageStream {
                 let finish_result = self.parser.finish();
                 let parser_errored = finish_result.is_err();
                 let leftover_empty = finish_result.as_ref().map(Vec::is_empty).unwrap_or(false);
-                if !self.has_emitted_meaningful_content
-                    && !self.observed_terminal
-                    && (parser_errored || leftover_empty)
-                    && self.stream_retries_remaining > 0
-                {
+                if should_retry_on_premature_eof(
+                    self.has_emitted_meaningful_content,
+                    self.observed_terminal,
+                    parser_errored,
+                    leftover_empty,
+                    self.stream_retries_remaining,
+                ) {
                     self.stream_retries_remaining -= 1;
                     eprintln!(
                         "stream restart (premature EOF, {} attempt(s) left)",
@@ -1399,5 +1426,43 @@ mod tests {
                 content_block: OutputContentBlock::Text { text: String::new() },
             }
         )));
+    }
+
+    /// v0.4.13 codex round-1 #3 — verify the premature-EOF retry trigger
+    /// truth table. Covers the "MessageStart only, then EOF" case that
+    /// P1.A is supposed to enable retry for, without needing to mock a
+    /// real SSE stream.
+    #[test]
+    fn should_retry_on_premature_eof_truth_table() {
+        // Happy path: MessageStart consumed (no meaningful), no terminal,
+        // parser finished with leftover_empty, retries remain → SHOULD retry.
+        assert!(super::should_retry_on_premature_eof(
+            /* has_emitted_meaningful_content */ false,
+            /* observed_terminal */ false,
+            /* parser_errored */ false,
+            /* leftover_empty */ true,
+            /* stream_retries_remaining */ 2,
+        ));
+
+        // Parser errored variant: should also retry.
+        assert!(super::should_retry_on_premature_eof(false, false, true, false, 2));
+
+        // Meaningful content already emitted (e.g. real text_delta yielded) →
+        // NO retry, would tear output.
+        assert!(!super::should_retry_on_premature_eof(true, false, false, true, 2));
+
+        // observed_terminal (MessageStop seen) → complete short response,
+        // NOT a premature EOF, NO retry.
+        assert!(!super::should_retry_on_premature_eof(false, true, false, true, 2));
+
+        // Neither parser errored NOR leftover_empty → there are events
+        // about to be replayed; NO retry, drain them.
+        assert!(!super::should_retry_on_premature_eof(false, false, false, false, 2));
+
+        // Retry budget exhausted → NO retry regardless of other state.
+        assert!(!super::should_retry_on_premature_eof(false, false, true, true, 0));
+
+        // Single retry left + good preconditions → DO retry.
+        assert!(super::should_retry_on_premature_eof(false, false, true, true, 1));
     }
 }
