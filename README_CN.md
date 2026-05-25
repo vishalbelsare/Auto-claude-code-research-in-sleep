@@ -342,7 +342,7 @@ cd Auto-claude-code-research-in-sleep && ls skills/ | xargs -I{} rm -rf ~/.claud
 </details>
 
 <details>
-<summary><b>展开全部 15 个内联参数和 8 个 override 示例</b> —— AUTO_PROCEED / sources / arxiv download / DBLP_BIBTEX / code review / wandb / illustration / venue / base repo / compact / ref paper / effort / reviewer / difficulty（完整 per-skill 默认值见 <a href="#%EF%B8%8F-自定义">§ 自定义</a>）</summary>
+<summary><b>展开全部 15 个内联参数和 8 个 override 示例</b> —— AUTO_PROCEED / sources / arxiv download / DBLP_BIBTEX / code review / wandb / illustration / venue / base repo / compact / ref paper / effort / reviewer / difficulty（完整 per-skill 默认值见 <a href="#customization">§ 自定义</a>）</summary>
 
 所有流水线行为均可通过内联参数配置——在命令后追加 `— key: value`：
 
@@ -403,7 +403,7 @@ cd Auto-claude-code-research-in-sleep && ls skills/ | xargs -I{} rm -rf ~/.claud
 - 📝 **论文写作** — 研究叙事 → 大纲 → 图表 → LaTeX → PDF → 自动审稿（4/10 → 8.5/10），一条命令。通过 [DBLP](https://dblp.org)/[CrossRef](https://www.crossref.org) 反幻觉引用
 - 🤖 **跨模型协作** — Claude Code 执行，GPT-5.4 xhigh 审稿。对抗式而非自我博弈。可选：`— reviewer: oracle-pro` → **GPT-5.4 Pro** via [Oracle](https://github.com/steipete/oracle)
 - 📝 **Peer Review** — 以审稿人视角审阅他人论文，结构化打分 + meta-review
-- 🖥️ **审稿驱动实验** — GPT-5.4 说"跑个消融"，Claude 自动写脚本、rsync 到 GPU、`screen` 启动、收结果、写回论文。`CLAUDE.md` 里配服务器（[配置](#%EF%B8%8F-gpu-服务器配置自动实验用)），或用 `gpu: vast` 从 [Vast.ai](https://vast.ai) 按需租
+- 🖥️ **审稿驱动实验** — GPT-5.4 说"跑个消融"，Claude 自动写脚本、rsync 到 GPU、`screen` 启动、收结果、写回论文。`CLAUDE.md` 里配服务器（[配置](#gpu-server-setup)），或用 `gpu: vast` 从 [Vast.ai](https://vast.ai) 按需租
 - 🔀 **灵活模型** — 默认 Claude × GPT-5.4，也支持 [GLM、MiniMax、Kimi、LongCat、DeepSeek 等](#alternative-model-combinations)——无需 Claude 或 OpenAI API
 - 🛑 **Human-in-the-loop** — 关键决策点可配置检查点。`AUTO_PROCEED=true` 全自动，`false` 逐步审批
 - 📱 **[飞书通知](docs/integrations/FEISHU_CN.md)** — 三种模式：**关闭（默认，推荐）**、仅推送（webhook → 手机）、双向交互（飞书里审批/回复）。未配置时零影响
@@ -564,7 +564,7 @@ ARIS 全流程完成并进入投稿/审稿阶段的真实项目。**这里不宣
 
 > 🔄 **人在回路中：** 每个阶段都会展示结果等你反馈。不满意？告诉它哪里不对——调整 prompt 重新生成。信任默认选择？它会自动带着最优方案继续。你决定参与多深。
 
-> ⚙️ Pilot 实验预算（最大时长、超时、GPU 总预算）均可配置——见[自定义](#%EF%B8%8F-自定义)。
+> ⚙️ Pilot 实验预算（最大时长、超时、GPU 总预算）均可配置——见[自定义](#customization)。
 
 <details>
 <summary><b>展开工作流 1 的命令清单示例</b> —— research-lit → idea-creator → novelty-check → research-refine → experiment-plan 一步步该敲什么</summary>
@@ -632,13 +632,13 @@ ARIS 全流程完成并进入投稿/审稿阶段的真实项目。**这里不宣
 
 > 💡 **一键调用：** `/experiment-bridge` 自动读取 `refine-logs/EXPERIMENT_PLAN.md`。也可指定：`/experiment-bridge "my_plan.md"`。
 
-> ⚙️ `CODE_REVIEW`、`AUTO_DEPLOY`、`SANITY_FIRST`、`MAX_PARALLEL_RUNS` 均可配置——见[自定义](#%EF%B8%8F-自定义)。
+> ⚙️ `CODE_REVIEW`、`AUTO_DEPLOY`、`SANITY_FIRST`、`MAX_PARALLEL_RUNS` 均可配置——见[自定义](#customization)。
 
 ### 工作流 2：自动科研循环 🔁（睡一觉醒来看结果）
 
 > "帮我 review 论文，修复问题，循环到通过为止。"
 >
-> GPT-5.4 审稿 → 定位弱点 → 建议实验 → Claude Code 自动写脚本、部署到 GPU、监控结果、改写论文——你睡觉就行。只需在 `CLAUDE.md` 里配好[GPU 服务器信息](#%EF%B8%8F-gpu-服务器配置自动实验用)。
+> GPT-5.4 审稿 → 定位弱点 → 建议实验 → Claude Code 自动写脚本、部署到 GPU、监控结果、改写论文——你睡觉就行。只需在 `CLAUDE.md` 里配好[GPU 服务器信息](#gpu-server-setup)。
 
 1. 🔍 **深度评审** — GPT-5.4 xhigh 对当前论文 / claims / 实验做一遍深读，定位弱点
 2. 🩹 **修复** — Claude 实现修复（改写章节、加 baseline、或通过 `/run-experiment` 跑新实验）；预估超过 4 GPU-小时的实验直接跳过、标记为"需人工跟进"
@@ -695,13 +695,13 @@ ARIS 全流程完成并进入投稿/审稿阶段的真实项目。**这里不宣
 
 </details>
 
-> ⚙️ MAX_ROUNDS、分数阈值、GPU 限制均可配置——见[自定义](#%EF%B8%8F-自定义)。
+> ⚙️ MAX_ROUNDS、分数阈值、GPU 限制均可配置——见[自定义](#customization)。
 
 📝 **博客：** [开源 | 睡觉 Claude 自动跑实验改文](http://xhslink.com/o/5cBMTDigNXz)
 
 ### 工作流 3：论文写作流水线 📝
 
-> "把我的研究报告变成可投稿的 PDF。" 需要本地 LaTeX 环境——见[前置条件](#前置条件)。
+> "把我的研究报告变成可投稿的 PDF。" 需要本地 LaTeX 环境——见[前置条件](#prerequisites)。
 
 1. 📝 **叙事** — 写 `NARRATIVE_REPORT.md`（声明 / 实验 / 结果 / 图表说明）；模板见 [`templates/NARRATIVE_REPORT_TEMPLATE.md`](templates/NARRATIVE_REPORT_TEMPLATE.md)
 2. 🧭 **规划** — `/paper-plan` 生成 claims-evidence 矩阵 + 分节计划
@@ -865,7 +865,7 @@ NARRATIVE_REPORT.md ──► /paper-plan ──► /paper-figure ──► /pap
 
 > 💡 **Quick mode：** `/rebuttal — quick mode: true` 跑完解析 + 策略（Phase 0-3）就停。先看 reviewer 想要什么，再决定要不要起草完整 draft。
 
-> ⚙️ `VENUE`、`AUTO_EXPERIMENT`、`QUICK_MODE`、`MAX_STRESS_TEST_ROUNDS` 都可配置 —— 见 [自定义](#%EF%B8%8F-自定义)。
+> ⚙️ `VENUE`、`AUTO_EXPERIMENT`、`QUICK_MODE`、`MAX_STRESS_TEST_ROUNDS` 都可配置 —— 见 [自定义](#customization)。
 
 **三道安全门 —— 任何一项不过 rebuttal 不定稿：**
 - 🔒 **出处可追** —— 每条 claim 都能追溯到 paper / review / 用户确认结果。不允许编造。
@@ -1168,6 +1168,8 @@ README 可扫读。
 
 ## 10. ⚙️ 安装
 
+<a id="prerequisites"></a>
+
 ### 前置条件
 
 1. 安装 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
@@ -1189,6 +1191,8 @@ README 可扫读。
    latexmk --version && pdfinfo -v
    ```
    > 如果只用工作流 1 和 2（找 idea + 自动 review），不需要安装 LaTeX。
+
+<a id="install-skills"></a>
 
 ### 安装 Skills
 
@@ -1300,6 +1304,8 @@ cp -r skills/experiment-bridge ~/.claude/skills/
   }
 }
 ```
+
+<a id="gpu-server-setup"></a>
 
 <details>
 <summary><h3>🖥️ GPU 服务器配置（自动跑实验用）</h3></summary>
@@ -1589,7 +1595,7 @@ Skills 就是普通的 Markdown 文件，fork 后随意改：
 | | 执行者 | 审稿人 | 需要 Claude API？ | 需要 OpenAI API？ | 配置指南 |
 |---|--------|--------|:---:|:---:|---------|
 | **默认** ⭐ | Claude Opus/Sonnet | GPT-5.4（Codex MCP） | 是 | 是 | [快速开始](#quick-start) |
-| **方案 A** | GLM-5（Z.ai） | GPT-5.4（Codex MCP） | 否 | 是 | [配置见下](#方案-a-glm--gpt) |
+| **方案 A** | GLM-5（Z.ai） | GPT-5.4（Codex MCP） | 否 | 是 | [配置见下](#alt-a-glm--gpt) |
 | **方案 B** | GLM-5（Z.ai） | MiniMax-M2.7 | 否 | 否 | [MINIMAX_MCP_GUIDE](docs/MINIMAX_MCP_GUIDE.md) |
 | **方案 C** | 任意 CC 兼容 | 任意 OpenAI 兼容 | 否 | 否 | [LLM_API_MIX_MATCH_GUIDE](docs/LLM_API_MIX_MATCH_GUIDE.md) |
 | **方案 D** | Kimi-K2.5 / Qwen3.5+ | GLM-5 / MiniMax-M2.7 | 否 | 否 | [ALI_CODING_PLAN_GUIDE](docs/ALI_CODING_PLAN_GUIDE.md) |
@@ -1628,6 +1634,8 @@ Skills 就是普通的 Markdown 文件，fork 后随意改：
 **方案 I** 保持 Codex 作为执行者，只增加一层很薄的 `skills-codex-gemini-review` overlay，并通过本地 `gemini-review` MCP bridge 把 reviewer-aware 预定义 skills 默认接到 direct Gemini API。这是与现有 Codex+Claude 审稿路径最接近的 Gemini 版本，同时 skill 改动最少，而且连 poster PNG 审查也复用了同一个 bridge。免费层可用性、限速和数据处理条款仍以 Google 当前政策为准。
 
 </details>
+
+<a id="alt-a-glm--gpt"></a>
 
 ### 方案 A: GLM + GPT
 
@@ -1677,7 +1685,7 @@ codex setup   # 提示选模型时选 gpt-5.5
 
 ### 配置完成后：安装 Skills 并验证
 
-推荐用上面 [§ 安装 Skills](#安装-skills) 的项目级 symlink 安装——所有方案通用。下面的全局拷贝是 fallback，如果你更习惯把所有 skill 放到 `~/.claude/skills/` 也行。
+推荐用上面 [§ 安装 Skills](#install-skills) 的项目级 symlink 安装——所有方案通用。下面的全局拷贝是 fallback，如果你更习惯把所有 skill 放到 `~/.claude/skills/` 也行。
 
 <details>
 <summary><b>展开全局拷贝 fallback 安装命令与非 Claude 执行者的验证 prompt</b></summary>
