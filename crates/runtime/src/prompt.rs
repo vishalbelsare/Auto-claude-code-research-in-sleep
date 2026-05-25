@@ -654,15 +654,53 @@ fn redact_url_to_origin(url: &str) -> String {
     if host_port.is_empty() {
         return "<redacted>".to_string();
     }
-    // Strict host validation: ASCII alphanumeric + `.`/`-`/`:` (port) +
-    // `[`/`]` (IPv6 brackets). Anything else (whitespace, backslash,
-    // control char, non-ASCII, etc.) → suspect, redact entirely.
-    let host_ok = host_port.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '_')
-    });
+    // Split into host part + optional port. IPv6 literals are bracketed,
+    // so the closing `]` defines the host end; everything after must be
+    // empty or `:<digits>`. For DNS/IPv4 hosts the first `:` separates
+    // host and port.
+    let (host_part, port_part): (&str, Option<&str>) = if host_port.starts_with('[') {
+        let Some(bracket_end) = host_port.find(']') else {
+            return "<redacted: invalid host>".to_string();
+        };
+        let host = &host_port[..=bracket_end];
+        let rest = &host_port[bracket_end + 1..];
+        if rest.is_empty() {
+            (host, None)
+        } else if let Some(stripped) = rest.strip_prefix(':') {
+            (host, Some(stripped))
+        } else {
+            return "<redacted: invalid host>".to_string();
+        }
+    } else {
+        match host_port.find(':') {
+            Some(idx) => (&host_port[..idx], Some(&host_port[idx + 1..])),
+            None => (host_port, None),
+        }
+    };
+
+    // Host: ASCII alphanumeric + `.`/`-`/`_` for DNS/IPv4, or bracketed
+    // IPv6 literal (`[`, hex digits, `:`, `.`, `]`).
+    let host_ok = if host_part.starts_with('[') && host_part.ends_with(']') {
+        host_part.chars().all(|c| {
+            c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '[' | ']')
+        })
+    } else {
+        !host_part.is_empty()
+            && host_part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
     if !host_ok {
         return "<redacted: invalid host>".to_string();
     }
+
+    // Port: must be all ASCII digits when present.
+    if let Some(port) = port_part {
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return "<redacted: invalid host>".to_string();
+        }
+    }
+
     format!("{}://{}", scheme, host_port)
 }
 
@@ -1406,6 +1444,28 @@ mod tests {
         assert!(redact_url_to_origin("https://host\nsk-secret").starts_with("<redacted:"));
         // Non-ASCII host → redact (could carry homograph-style smuggling).
         assert!(redact_url_to_origin("https://例え.com").starts_with("<redacted:"));
+        // Port smuggling: non-digit port part should reject the whole URL
+        // (codex round 3 P1: `https://host:sk-secret/path` would otherwise
+        // leak `sk-secret` into the rendered origin).
+        assert!(
+            redact_url_to_origin("https://api.github.com:sk-mcp-port-leak/path")
+                .starts_with("<redacted:"),
+            "non-digit port must reject the URL"
+        );
+        assert!(
+            redact_url_to_origin("https://host:").starts_with("<redacted:"),
+            "empty port must reject the URL"
+        );
+        // IPv6 with trailing garbage instead of port (`[::1]garbage`).
+        assert!(
+            redact_url_to_origin("https://[::1]garbage").starts_with("<redacted:"),
+            "IPv6 trailing garbage must reject the URL"
+        );
+        // IPv6 with non-digit port (`[::1]:sk-secret`).
+        assert!(
+            redact_url_to_origin("https://[::1]:sk-secret").starts_with("<redacted:"),
+            "IPv6 non-digit port must reject the URL"
+        );
     }
 
     #[test]
@@ -1436,9 +1496,14 @@ mod tests {
             rendered.contains("\"beta\"") && rendered.contains("command=<empty>"),
             "empty string command should render as <empty>: {rendered}"
         );
+        // Strict: scan only the gamma row and assert it carries no `command=` field.
+        let gamma_line = rendered
+            .lines()
+            .find(|l| l.contains("\"gamma\""))
+            .expect("gamma row must exist");
         assert!(
-            rendered.contains("\"gamma\"") && !rendered.contains("gamma command="),
-            "missing command should not produce a command= field: {rendered}"
+            !gamma_line.contains("command="),
+            "missing command must not surface as a command= field on its row: {gamma_line}"
         );
         assert!(
             rendered.contains("\"delta\"") && rendered.contains("command=<unrecognized shape>"),
