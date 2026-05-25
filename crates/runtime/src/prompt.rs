@@ -627,11 +627,20 @@ fn type_indicator(value: &crate::json::JsonValue) -> String {
 /// Reduce a URL string to scheme + host (+ port) only, dropping userinfo,
 /// path, query, and fragment — any of which can carry secrets
 /// (basic-auth, signed tokens, query params like `?api_key=...`).
+///
+/// Hand-rolled instead of pulling in the `url` crate; we trade some leniency
+/// for a small surface. Anything that doesn't match a strict scheme + ASCII
+/// host shape is fully redacted, so malformed values can't smuggle secrets.
 fn redact_url_to_origin(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return "<redacted: not a url>".to_string();
     };
     let scheme = &url[..scheme_end];
+    // Allow-list common transport schemes; anything else is suspicious.
+    let scheme_allowed = matches!(scheme, "http" | "https" | "ws" | "wss");
+    if !scheme_allowed {
+        return "<redacted: unrecognized scheme>".to_string();
+    }
     let after_scheme = &url[scheme_end + 3..];
     let host_end = after_scheme
         .find(|c: char| c == '/' || c == '?' || c == '#')
@@ -644,6 +653,15 @@ fn redact_url_to_origin(url: &str) -> String {
     };
     if host_port.is_empty() {
         return "<redacted>".to_string();
+    }
+    // Strict host validation: ASCII alphanumeric + `.`/`-`/`:` (port) +
+    // `[`/`]` (IPv6 brackets). Anything else (whitespace, backslash,
+    // control char, non-ASCII, etc.) → suspect, redact entirely.
+    let host_ok = host_port.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '_')
+    });
+    if !host_ok {
+        return "<redacted: invalid host>".to_string();
     }
     format!("{}://{}", scheme, host_port)
 }
@@ -673,8 +691,19 @@ fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
             } else if let Some(JsonValue::String(transport)) = obj.get("transport") {
                 parts.push(format!("transport={}", transport));
             }
-            if obj.contains_key("command") {
-                parts.push("command=<configured>".to_string());
+            // Show `command=<configured>` only for a non-empty string field;
+            // distinguish that from missing field / empty string / non-string.
+            match obj.get("command") {
+                Some(JsonValue::String(s)) if !s.is_empty() => {
+                    parts.push("command=<configured>".to_string());
+                }
+                Some(JsonValue::String(_)) => {
+                    parts.push("command=<empty>".to_string());
+                }
+                Some(_) => {
+                    parts.push("command=<unrecognized shape>".to_string());
+                }
+                None => {}
             }
             if let Some(JsonValue::String(url)) = obj.get("url") {
                 parts.push(format!("origin={}", redact_url_to_origin(url)));
@@ -705,6 +734,14 @@ fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
         let mut hook_count = 0usize;
         if let Some(matcher_array) = matchers.as_array() {
             for matcher in matcher_array {
+                // Claude Code config supports both string-style items
+                // (the array entry is itself a command string) and the
+                // canonical object-style `{matcher, hooks: [...]}` form.
+                // Count both so the summary reflects what is actually loaded.
+                if matcher.as_str().is_some() {
+                    hook_count += 1;
+                    continue;
+                }
                 if let Some(matcher_obj) = matcher.as_object() {
                     if let Some(hook_list) =
                         matcher_obj.get("hooks").and_then(JsonValue::as_array)
@@ -850,10 +887,12 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_config_section, render_instruction_content, render_instruction_files,
+        redact_url_to_origin, render_config_section, render_hooks_summary,
+        render_instruction_content, render_instruction_files, render_mcp_servers_summary,
         truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
         SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
+    use crate::json::JsonValue;
     use crate::config::ConfigLoader;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1334,5 +1373,111 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn redact_url_to_origin_handles_normal_and_malformed_input() {
+        // Happy path: scheme + host preserved, userinfo/path/query/fragment dropped.
+        assert_eq!(
+            redact_url_to_origin("https://user:pass@example.com/path?token=xxx#frag"),
+            "https://example.com"
+        );
+        assert_eq!(
+            redact_url_to_origin("http://localhost:3000/api"),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            redact_url_to_origin("wss://socket.example.org:8443"),
+            "wss://socket.example.org:8443"
+        );
+        // IPv6 literal in brackets.
+        assert_eq!(
+            redact_url_to_origin("https://[::1]:8080/api"),
+            "https://[::1]:8080"
+        );
+
+        // Malformed: no scheme delimiter.
+        assert_eq!(redact_url_to_origin("not-a-url"), "<redacted: not a url>");
+        // Suspect scheme (e.g. attempt to smuggle secrets via odd scheme).
+        assert!(redact_url_to_origin("sk-secret://host").starts_with("<redacted:"));
+        // Host containing whitespace / backslash / control char → redact.
+        assert!(redact_url_to_origin("https://host\\sk-secret").starts_with("<redacted:"));
+        assert!(redact_url_to_origin("https://host sk-secret").starts_with("<redacted:"));
+        assert!(redact_url_to_origin("https://host\nsk-secret").starts_with("<redacted:"));
+        // Non-ASCII host → redact (could carry homograph-style smuggling).
+        assert!(redact_url_to_origin("https://例え.com").starts_with("<redacted:"));
+    }
+
+    #[test]
+    fn mcp_summary_distinguishes_missing_empty_and_configured_command() {
+        let mut servers = std::collections::BTreeMap::new();
+        // Server A: command present and non-empty.
+        let mut a = std::collections::BTreeMap::new();
+        a.insert("command".to_string(), JsonValue::String("npx".to_string()));
+        servers.insert("alpha".to_string(), JsonValue::Object(a));
+        // Server B: command is empty string.
+        let mut b = std::collections::BTreeMap::new();
+        b.insert("command".to_string(), JsonValue::String("".to_string()));
+        servers.insert("beta".to_string(), JsonValue::Object(b));
+        // Server C: command field missing entirely.
+        let c = std::collections::BTreeMap::new();
+        servers.insert("gamma".to_string(), JsonValue::Object(c));
+        // Server D: command is wrong type (number).
+        let mut d = std::collections::BTreeMap::new();
+        d.insert("command".to_string(), JsonValue::Number(42));
+        servers.insert("delta".to_string(), JsonValue::Object(d));
+
+        let rendered = render_mcp_servers_summary(&JsonValue::Object(servers)).join("\n");
+        assert!(
+            rendered.contains("\"alpha\"") && rendered.contains("command=<configured>"),
+            "non-empty command should render as <configured>: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"beta\"") && rendered.contains("command=<empty>"),
+            "empty string command should render as <empty>: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"gamma\"") && !rendered.contains("gamma command="),
+            "missing command should not produce a command= field: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"delta\"") && rendered.contains("command=<unrecognized shape>"),
+            "non-string command should render as <unrecognized shape>: {rendered}"
+        );
+    }
+
+    #[test]
+    fn hooks_summary_counts_both_string_and_object_style_items() {
+        let mut events = std::collections::BTreeMap::new();
+        // Mix string-style and object-style entries under the same event.
+        let string_item = JsonValue::String("inline-command.sh".to_string());
+        let mut object_item_inner = std::collections::BTreeMap::new();
+        object_item_inner.insert(
+            "hooks".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::Object({
+                    let mut h = std::collections::BTreeMap::new();
+                    h.insert("command".to_string(), JsonValue::String("a".to_string()));
+                    h
+                }),
+                JsonValue::Object({
+                    let mut h = std::collections::BTreeMap::new();
+                    h.insert("command".to_string(), JsonValue::String("b".to_string()));
+                    h
+                }),
+            ]),
+        );
+        let object_item = JsonValue::Object(object_item_inner);
+        events.insert(
+            "PostToolUse".to_string(),
+            JsonValue::Array(vec![string_item, object_item]),
+        );
+
+        let rendered = render_hooks_summary(&JsonValue::Object(events)).join("\n");
+        // string-style: 1, object-style: 2 → total 3
+        assert!(
+            rendered.contains("PostToolUse: 3 hook(s)"),
+            "expected mixed-style count of 3 hooks: {rendered}"
+        );
     }
 }
