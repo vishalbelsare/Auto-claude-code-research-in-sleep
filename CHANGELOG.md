@@ -1,5 +1,150 @@
 # ARIS-Code Changelog
 
+## v0.4.14 (2026-05-25)
+
+A **security-hygiene** release closing the top items from the v0.4.13
+codex audit (gpt-5.5 xhigh, 6/10 NEEDS-REWORK verdict): one P0 (config
+secret leak in system prompt), one P1 trivial (DeepSeek help doc), one
+P1 documentation (MCP experimental status), one P2 reliability (stream
+idle timeout). No headlining new feature.
+
+Codex MCP cross-review: 4 rounds (NO-GO → GO-WITH-NITS → NO-GO →
+**GO**). Findings + fixes captured in
+`idea-stage/v0.4.14/audit-followup-plan.md`.
+
+### 🔴 S9 (P0 security) — config redaction in system prompt
+
+Before v0.4.14, `render_config_section()` dumped the merged
+`settings.json` value verbatim into the system prompt sent to the LLM
+provider. Anything you put in `settings.json` — `env` maps,
+`mcpServers.<name>.headers.Authorization` Bearer tokens, hook command
+env, `apiKey` fields, signed URL parameters — would round-trip through
+the model's context window. For users running an OpenAI-compatible
+proxy executor with Anthropic-format settings, that is a real
+cross-vendor token leak path.
+
+`render_config_section()` now:
+
+- Renders a **whitelist** of top-level fields (`model`,
+  `permissionMode`, `theme`, `outputStyle`, `permissions`, `sandbox`)
+  with values intact, recursing into sub-trees to redact sensitive keys.
+- Recursively replaces values under sensitive keys with `"[REDACTED]"`.
+  Sensitive keys are matched case-insensitively on substring (`apikey`,
+  `token`, `secret`, `password`, `authorization`, `headers`, `env`) and
+  suffix (`_KEY`, `_SECRET`, `_TOKEN`).
+- For non-whitelisted top-level fields, prints a type indicator
+  (`<object: N keys>`, `<string: N chars>`, `<array: N items>`) so users
+  can see the structure without leaking values.
+- For `mcpServers`: shows server name + transport + a fixed
+  `command=<configured>` / `command=<empty>` / `command=<unrecognized
+  shape>` placeholder, plus `origin=<scheme://host[:port]>` only.
+  `args`, `env`, `headers`, full URL (path/query/userinfo/fragment) are
+  never rendered. URL parsing is hand-rolled with strict scheme +
+  host + port validation; anything malformed → `<redacted: ...>`.
+- For `hooks`: shows event name + hook count per event. Hook command
+  strings are **never rendered** (they routinely embed `curl -H
+  'Authorization: Bearer ...'`-style invocations).
+
+Regression test exercises 9 distinct leak surfaces (top-level
+`apiKey`/`env`, MCP `headers`/`command`/`url`-userinfo/`url`-query/
+`args`, hook `command`/`env`, nested `sandbox.env`/`sandbox.apiKey`),
+asserting that none of the 9 mock secrets appear in the rendered
+output while whitelist fields remain visible.
+
+URL redaction has its own targeted test covering happy paths (DNS,
+IPv4, IPv6, ports) plus 7 smuggling attempts (no scheme, suspect
+scheme, backslash/whitespace/control-char host, non-ASCII host,
+non-digit port, empty port, IPv6 trailing garbage, IPv6 non-digit
+port). MCP `command` summary and hook count both have dedicated
+branch-coverage tests too.
+
+### 🟡 P9 (P1 trivial) — DeepSeek help line pointed at the wrong path
+
+`aris --help` printed:
+
+```
+DeepSeek:  EXECUTOR_PROVIDER=anthropic-compat EXECUTOR_BASE_URL=... aris --model deepseek-v4-pro
+```
+
+but `resolve_openai_executor_config()` only honors
+`EXECUTOR_PROVIDER=openai`; the `anthropic-compat` path is configured
+through `aris setup` and is **menu option 7** (not the placeholder
+"option 6" the round-1 fix briefly used). Help text now points users at
+`aris setup → option 7 (DeepSeek) → base URL https://api.deepseek.com/anthropic`,
+which actually wires up `executor_provider="anthropic-compat"`,
+`ANTHROPIC_AUTH_TOKEN`, and the correct base URL.
+
+### 🟡 M1/M2 (P1 doc) — MCP experimental status surfaced
+
+The v0.4.13 stdio reliability fixes (per-server timeout, JSON-RPC
+notifications skip) are real, but `McpServerManager` is **not** wired
+into `CliToolExecutor`'s tool dispatch yet — meaning `mcpServers`
+configured in `settings.json` will be parsed, validated, and shown in
+`aris doctor`, but their tool calls do not reach the LLM context. Codex
+audit M1/M2 finding.
+
+v0.4.14 surfaces this honestly:
+
+- `aris doctor`'s MCP section now prints a yellow experimental warning
+  whenever `mcpServers.len() > 0` saying full dispatch is planned for
+  v0.4.16.
+- README + README_CN both gain an `🔌 MCP servers (experimental)` /
+  `🔌 MCP servers（实验性）` section with the same callout, plus a note
+  that the Codex MCP reviewer is the exception (it goes through the
+  dedicated reviewer path, not the generic MCP dispatch).
+
+Full MCP tool dispatch is on the v0.4.16 roadmap.
+
+### 🟢 C11 (P2 reliability) — stream idle timeout
+
+Both streaming pipelines (Anthropic `MessageStream` and OpenAI SSE
+loop) now wrap `response.chunk().await` in `tokio::time::timeout`,
+configurable via `ARIS_STREAM_IDLE_TIMEOUT_SECS` (default `120`,
+clamped to `[10, 1800]`; setting `0` or a negative value disables the
+timeout). On idle the stream takes the same path as a mid-body
+abort: restart the request if no meaningful content has been emitted
+yet (Anthropic gates on `has_emitted_meaningful_content`, OpenAI on
+`nothing_emitted_yet()`), otherwise return an idle-timeout error.
+
+Closes the "aris hangs forever with no output" symptom when an upstream
+HTTPS proxy holds a connection open without sending keepalives. The
+parsed-env helper has 9 unit cases covering default, valid, clamp
+bounds, zero/negative, parse failure, and edge boundaries.
+
+### 🟢 H11 (P2 trivial) — sync script hint version bump
+
+`tools/sync_main_skills.sh` final hint and inline NOTE both rolled
+from `v0.4.11` (when the sync infrastructure first landed) to
+`v0.4.13` (current bundle generation). Cosmetic.
+
+### Test inventory
+
+`cargo test -p runtime --lib`: 117 passed (3 new prompt tests +
+existing 9 v0.4.13 regression backfill).
+`cargo test -p api --lib`: 19 passed (1 new stream-idle helper test).
+`cargo test -p aris-cli`: 77 passed.
+`cargo test -p tools --lib`: 35 passed.
+`cargo test -p commands --lib`: 5 passed.
+
+### Excluded from v0.4.14
+
+Three items from the audit are deferred to follow-up releases by design
+(see `idea-stage/v0.4.14/audit-followup-plan.md`):
+
+- **P7 ProviderFamily resolver** centralization (5+ scattered
+  `contains()`/`provider_match()`/`EXECUTOR_PROVIDER==openai` /
+  `starts_with()` checks) — v0.4.15, scoped as a real refactor not a
+  hotfix.
+- **P8 Subagent provider parity** (`build_agent_runtime()` always
+  binds `AnthropicRuntimeClient`) — v0.4.15.
+- **Hook schema preservation** (matcher/timeout/async fields
+  currently dropped) + **MCP manager production wiring** (M1/M2 real
+  fix) — v0.4.16.
+
+OpenSSL → rustls switch (L1), full sandbox hardening (S1-S6), JSON
+parser standardization (C10), and provider abstraction trait remain
+v0.5.0 scope. Per the v0.4.14 audit-followup plan.
+
 ## v0.4.13 (2026-05-25)
 
 A residue-cleanup release closing every codex-audit P1 left over from
