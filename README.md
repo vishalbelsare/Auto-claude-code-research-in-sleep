@@ -318,7 +318,7 @@ The system prompt explicitly informs the model of its exact identity (ARIS-Code)
 ## 🔌 MCP servers (experimental)
 
 > ⚠ **Experimental**: As of v0.4.14, MCP servers configured in
-> `settings.json` are validated and probed (stdio handshake works),
+> `settings.json` are parsed and surfaced in `aris doctor`,
 > but **tool calls from MCP servers are not yet dispatched into the
 > LLM context**. Full MCP tool dispatch is planned for v0.4.16.
 

@@ -5023,7 +5023,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  DeepSeek:  Run `aris setup` (option 6: Anthropic-compat) → base URL https://api.deepseek.com/anthropic"
+        "  DeepSeek:  Run `aris setup` → option 7 (DeepSeek) → base URL https://api.deepseek.com/anthropic"
     )?;
     writeln!(
         out,

@@ -214,7 +214,7 @@ echo
 echo "  2. cargo test -p runtime --lib cache -- --test-threads=1"
 echo "     # 9 cache tests should pass (6 existing + 3 v0.4.11 drift tests)"
 echo
-echo "  3. ./target/release/aris --version       # → 0.4.11 (after Cargo.toml bump)"
+echo "  3. ./target/release/aris --version       # → 0.4.13 (or current after Cargo.toml bump)"
 echo "  4. ./target/release/aris doctor          # smoke test"
 echo
 echo "  5. git diff --stat crates/runtime/assets/"

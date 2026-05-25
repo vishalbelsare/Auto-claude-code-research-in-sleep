@@ -624,8 +624,35 @@ fn type_indicator(value: &crate::json::JsonValue) -> String {
     }
 }
 
-/// Render the `mcpServers` summary: only server name + transport +
-/// command/url. Headers, env, args are never rendered.
+/// Reduce a URL string to scheme + host (+ port) only, dropping userinfo,
+/// path, query, and fragment — any of which can carry secrets
+/// (basic-auth, signed tokens, query params like `?api_key=...`).
+fn redact_url_to_origin(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return "<redacted: not a url>".to_string();
+    };
+    let scheme = &url[..scheme_end];
+    let after_scheme = &url[scheme_end + 3..];
+    let host_end = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..host_end];
+    // Strip userinfo (`user:pass@`) — must use rfind because passwords can contain `@`.
+    let host_port = match authority.rfind('@') {
+        Some(at_pos) => &authority[at_pos + 1..],
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return "<redacted>".to_string();
+    }
+    format!("{}://{}", scheme, host_port)
+}
+
+/// Render the `mcpServers` summary: server name + transport only. Command,
+/// URL path/query/userinfo, headers, env, args are all considered sensitive
+/// because they may contain secrets (signed URLs, basic-auth, wrapped command
+/// invocations like `curl -H 'Authorization: Bearer xxx' ...`). URL origin
+/// (scheme + host) is shown so users can recognize the server.
 fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
     use crate::json::JsonValue;
     let mut lines = Vec::new();
@@ -646,11 +673,11 @@ fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
             } else if let Some(JsonValue::String(transport)) = obj.get("transport") {
                 parts.push(format!("transport={}", transport));
             }
-            if let Some(JsonValue::String(cmd)) = obj.get("command") {
-                parts.push(format!("command={:?}", cmd));
+            if obj.contains_key("command") {
+                parts.push("command=<configured>".to_string());
             }
             if let Some(JsonValue::String(url)) = obj.get("url") {
-                parts.push(format!("url={:?}", url));
+                parts.push(format!("origin={}", redact_url_to_origin(url)));
             }
         }
         lines.push(format!("    - {}", parts.join(" ")));
@@ -658,8 +685,10 @@ fn render_mcp_servers_summary(value: &crate::json::JsonValue) -> Vec<String> {
     lines
 }
 
-/// Render the `hooks` summary: only event name + truncated command prefix.
-/// `env` and any other auxiliary fields are dropped.
+/// Render the `hooks` summary: only event name + hook count per event.
+/// Command strings are never rendered because they routinely contain
+/// secrets (e.g. `curl -H "Authorization: Bearer xxx"` or
+/// `OPENAI_API_KEY=sk-... script.sh`).
 fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
     use crate::json::JsonValue;
     let mut lines = Vec::new();
@@ -673,30 +702,19 @@ fn render_hooks_summary(value: &crate::json::JsonValue) -> Vec<String> {
     }
     lines.push(format!("hooks ({} events):", events.len()));
     for (event, matchers) in events {
-        let mut commands_rendered = 0usize;
+        let mut hook_count = 0usize;
         if let Some(matcher_array) = matchers.as_array() {
             for matcher in matcher_array {
-                let Some(matcher_obj) = matcher.as_object() else { continue };
-                if let Some(hook_list) = matcher_obj.get("hooks").and_then(JsonValue::as_array) {
-                    for hook in hook_list {
-                        if let Some(hook_obj) = hook.as_object() {
-                            if let Some(JsonValue::String(cmd)) = hook_obj.get("command") {
-                                let prefix: String = cmd.chars().take(50).collect();
-                                let ellipsis = if cmd.chars().count() > 50 { "..." } else { "" };
-                                lines.push(format!(
-                                    "    - {event}: command={:?}{}",
-                                    prefix, ellipsis
-                                ));
-                                commands_rendered += 1;
-                            }
-                        }
+                if let Some(matcher_obj) = matcher.as_object() {
+                    if let Some(hook_list) =
+                        matcher_obj.get("hooks").and_then(JsonValue::as_array)
+                    {
+                        hook_count += hook_list.len();
                     }
                 }
             }
         }
-        if commands_rendered == 0 {
-            lines.push(format!("    - {event}: <no command entries>"));
-        }
+        lines.push(format!("    - {event}: {hook_count} hook(s) configured"));
     }
     lines
 }
@@ -1123,11 +1141,17 @@ mod tests {
 
     #[test]
     fn render_config_section_redacts_sensitive_fields() {
-        // Build a settings.json with three different secret locations:
+        // Build a settings.json that exercises every known secret-leak path:
         //   1. Top-level `env` map (hook/agent env)
-        //   2. `mcpServers.github.headers.Authorization` (Bearer token)
-        //   3. `hooks.SessionEnd[].hooks[].env` (per-hook env)
-        // plus a top-level `apiKey` and one whitelisted field (`model`).
+        //   2. Top-level `apiKey`
+        //   3. `mcpServers.<name>.headers.Authorization` (Bearer token)
+        //   4. `mcpServers.<name>.command` (wrapper command containing secrets)
+        //   5. `mcpServers.<name>.url` userinfo + query string secrets
+        //   6. `mcpServers.<name>.args` (CLI args containing secrets)
+        //   7. `hooks.<event>[].hooks[].env` (per-hook env)
+        //   8. `hooks.<event>[].hooks[].command` (command containing secrets)
+        //   9. `sandbox.env` (nested sensitive key inside whitelisted field)
+        //  10. `sandbox.apiKey` (direct sensitive key inside whitelisted field)
         let root = temp_dir();
         fs::create_dir_all(root.join(".claude")).expect("claude dir");
         let settings = r#"{
@@ -1138,8 +1162,9 @@ mod tests {
             "mcpServers": {
                 "github": {
                     "type": "http",
-                    "command": "npx",
-                    "url": "https://api.github.com/mcp",
+                    "command": "curl -H 'Authorization: Bearer sk-mcp-command-leak'",
+                    "url": "https://user:sk-mcp-userinfo-leak@api.github.com/v1?token=sk-mcp-query-leak",
+                    "args": ["--api-key", "sk-mcp-args-leak"],
                     "headers": {"Authorization": "Bearer xyz-secret"}
                 }
             },
@@ -1150,12 +1175,17 @@ mod tests {
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "echo done",
+                                "command": "curl -H 'Authorization: Bearer sk-hook-command-leak'",
                                 "env": {"OPENAI_KEY": "sk-xxx-hook"}
                             }
                         ]
                     }
                 ]
+            },
+            "sandbox": {
+                "strictMode": true,
+                "env": {"SANDBOX_TOKEN": "sk-sandbox-nested-leak"},
+                "apiKey": "sk-sandbox-direct-leak"
             }
         }"#;
         fs::write(root.join(".claude").join("settings.json"), settings)
@@ -1183,6 +1213,7 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_HOME");
         }
 
+        // === Baseline secrets (existing assertions) ===
         // No raw secrets must appear anywhere.
         assert!(
             !rendered.contains("abc123"),
@@ -1209,6 +1240,43 @@ mod tests {
             "raw top-level apiKey leaked: {rendered}"
         );
 
+        // === Bypass regression cases (codex v0.4.14 round 1 P1 finding) ===
+        // MCP command field can contain wrapper invocations with secrets.
+        assert!(
+            !rendered.contains("sk-mcp-command-leak"),
+            "MCP command field secret leaked: {rendered}"
+        );
+        // URL userinfo (basic-auth password).
+        assert!(
+            !rendered.contains("sk-mcp-userinfo-leak"),
+            "MCP url userinfo secret leaked: {rendered}"
+        );
+        // URL query string (?token=...).
+        assert!(
+            !rendered.contains("sk-mcp-query-leak"),
+            "MCP url query secret leaked: {rendered}"
+        );
+        // MCP CLI args (e.g. `--api-key xxx`).
+        assert!(
+            !rendered.contains("sk-mcp-args-leak"),
+            "MCP args secret leaked: {rendered}"
+        );
+        // Hook command field can contain `curl -H 'Authorization: Bearer xxx'`.
+        assert!(
+            !rendered.contains("sk-hook-command-leak"),
+            "hook command secret leaked: {rendered}"
+        );
+        // Whitelisted top-level field (sandbox) must still recursively redact
+        // nested sensitive keys.
+        assert!(
+            !rendered.contains("sk-sandbox-nested-leak"),
+            "sandbox nested env secret leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sk-sandbox-direct-leak"),
+            "sandbox direct apiKey secret leaked: {rendered}"
+        );
+
         // The redaction sentinel must be present.
         assert!(
             rendered.contains("[REDACTED]"),
@@ -1226,16 +1294,24 @@ mod tests {
         );
 
         // MCP server name must still appear (so users know the server is
-        // configured), command/url too — but headers must not.
+        // configured); URL origin (scheme + host) is OK but path/query/userinfo
+        // must be stripped, and the wrapper command field is replaced with
+        // a placeholder.
         assert!(rendered.contains("github"), "MCP server name missing: {rendered}");
-        // The literal lowercase `"headers"` key string SHOULD NOT appear in
-        // the output, because the MCP summary deliberately omits it.
+        assert!(
+            rendered.contains("api.github.com"),
+            "expected MCP url origin (host) in output: {rendered}"
+        );
+        assert!(
+            rendered.contains("command=<configured>"),
+            "expected MCP command placeholder: {rendered}"
+        );
         assert!(
             !rendered.contains("\"Authorization\""),
             "Authorization key leaked in MCP summary: {rendered}"
         );
 
-        // Hooks summary should mention SessionEnd but not its env.
+        // Hooks summary should mention SessionEnd but not env or command body.
         assert!(
             rendered.contains("SessionEnd"),
             "hook event name missing: {rendered}"
@@ -1243,6 +1319,18 @@ mod tests {
         assert!(
             !rendered.contains("OPENAI_KEY"),
             "hook env key leaked: {rendered}"
+        );
+        // Hook count should appear (the test config has 1 hook under SessionEnd).
+        assert!(
+            rendered.contains("1 hook"),
+            "expected hook count rendering: {rendered}"
+        );
+
+        // Sandbox section must still surface its non-sensitive fields
+        // (strictMode) so users can verify their policy is loaded.
+        assert!(
+            rendered.contains("strictMode"),
+            "expected sandbox.strictMode to remain visible: {rendered}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
