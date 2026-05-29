@@ -1,5 +1,94 @@
 # ARIS-Code Changelog
 
+## v0.4.15 (2026-05-29)
+
+A focused **OpenAI-compatible streaming robustness** hotfix. Closes
+issue [#249](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/issues/249):
+MiniMax (and other OpenAI-compatible providers / proxies) were
+effectively unusable because aris-code treated the `data: [DONE]` SSE
+sentinel as the *only* authoritative stream-completion signal.
+
+Seeded by a read-only streaming-interop audit (5-agent workflow) and
+cross-reviewed by Codex MCP (gpt-5.5 xhigh) over 3 rounds
+(GO-WITH-NITS → GO-WITH-NITS → GO). All changes live in one file
+(`crates/aris-cli/src/openai_executor.rs`); the Anthropic SSE path is
+untouched.
+
+### 🔴 #249 — `finish_reason` is a valid completion signal
+
+The OpenAI Chat Completions spec defines a non-empty
+`choices[].finish_reason` as the model's terminal chunk; `data: [DONE]`
+is an SSE-transport convention that **not every compatible provider
+emits**. MiniMax sends `finish_reason: "stop"` then closes the
+connection without `[DONE]`, so the clean-EOF branch — which only broke
+on `observed_done` — fell through to a hard
+`OpenAI stream ended prematurely without [DONE] sentinel` error on
+*every* successful completion.
+
+The clean-EOF decision is now a pure, unit-tested function:
+
+```
+stream_eof_action(observed_done, observed_finish_reason,
+                  nothing_emitted, retries_remaining)
+    -> { Complete, Restart, Truncated }
+```
+
+A response is **complete** when *either* `[DONE]` OR a non-empty
+`finish_reason` arrived. Crucially the read loop is **not** stopped
+early at `finish_reason` — a trailing usage-only chunk (emitted under
+`stream_options.include_usage` between the finish_reason chunk and
+`[DONE]`) is still consumed, so `/cost` accounting is unaffected.
+`finish_reason` only re-classifies an *already-reached* clean EOF from
+"truncated" to "complete". A genuine mid-response truncation (neither
+signal seen + content already emitted) still hard-errors, and a
+proxy abort before any output still restarts within the
+`ARIS_STREAM_RETRY` budget. This mirrors the lenience the Anthropic
+path already had (synthesize-terminal-on-missing-MessageStop).
+
+### Coupled robustness fixes (same SSE path)
+
+- **OE7** — `finish_reason` is now read *before* the `delta` guard. A
+  terminal choice carrying only `finish_reason` and no `delta` was
+  previously skipped wholesale, which would have defeated the
+  completion check above.
+- **OE2** — pending tool calls flush on *any* non-empty `finish_reason`,
+  not just `stop`/`tool_calls`. Compatible providers send
+  `length` / `content_filter` / `max_output` / `sensitive`; flushing
+  here preserves in-stream ordering and per-tool terminal rendering
+  (`length` / `content_filter` also print a truncated/filtered hint).
+- **OE4** — a mid-stream error envelope (top-level non-null `error`,
+  no `choices`) now hard-errors instead of being silently dropped by
+  the `choices` guard. This closes the regression window where an
+  error arriving *after* a `finish_reason` would otherwise be misjudged
+  a success. Only `message` + `code`/`type` are surfaced — never the
+  whole envelope.
+- **OE3** — SSE `data:` parsing tolerates a missing space after the
+  colon (`data:{...}`, which W3C EventSource permits and some
+  compatible providers emit). The old `strip_prefix("data: ")` silently
+  dropped such lines.
+
+### Tests
+
+`cargo test -p aris-cli`: 82 passed (was 77 at v0.4.14; **+5**).
+New coverage extracts the previously-untested SSE completion logic into
+pure helpers: `stream_eof_action` truth table (11 cases),
+`stream_error_detail` (9), `choice_finish_reason` (6),
+`accumulate_tool_call`, `sse_data_payload` (12). Mirrors the
+`api/src/client.rs` `should_retry_on_premature_eof` truth-table pattern.
+
+### Deferred to v0.4.16
+
+The same audit surfaced lower-priority / larger siblings left for the
+next release: **CL2** (Anthropic `MessageDelta.stop_reason` symmetry —
+the Anthropic path is already lenient so no user is blocked), **OE6**
+(tool-call slot routing by `id` for parallel calls), **OE5** (usage
+field-name fallbacks), **OE8** (SSE `event:` field). The
+ProviderFamily resolver (P7) and Subagent provider parity (P8) remain
+v0.4.16 scope. A separate pre-existing test-isolation issue (the
+`api` crate's `read_api_key_*` tests read the user's real
+`~/.config/aris/config.json` instead of an isolated temp dir, poisoning
+`env_lock` locally — CI is unaffected) is also tracked for v0.4.16.
+
 ## v0.4.14 (2026-05-25)
 
 A **security-hygiene** release closing the top items from the v0.4.13
